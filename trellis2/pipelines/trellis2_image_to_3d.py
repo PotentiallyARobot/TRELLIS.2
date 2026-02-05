@@ -1,3 +1,4 @@
+import os
 from typing import *
 import torch
 import torch.nn as nn
@@ -102,8 +103,20 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline.tex_slat_normalization = args['tex_slat_normalization']
 
         pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
-        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
-        
+        disable_rembg = os.getenv("TRELLIS2_DISABLE_REMBG", "0").lower() in ("1", "true", "yes")
+        if disable_rembg:
+            pipeline.rembg_model = None
+        else:
+            disable_rembg = os.getenv("TRELLIS2_DISABLE_REMBG", "0").lower() in ("1", "true", "yes")
+            if disable_rembg:
+                pipeline.rembg_model = None
+            else:
+                disable_rembg = os.getenv("TRELLIS2_DISABLE_REMBG", "0").lower() in ("1", "true", "yes")
+                if disable_rembg:
+                    pipeline.rembg_model = None
+                else:
+                    pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
+
         pipeline.low_vram = args.get('low_vram', True)
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
         pipeline.pbr_attr_layout = {
@@ -141,12 +154,24 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if has_alpha:
             output = input
         else:
-            input = input.convert('RGB')
-            if self.low_vram:
-                self.rembg_model.to(self.device)
-            output = self.rembg_model(input)
-            if self.low_vram:
-                self.rembg_model.cpu()
+            if self.rembg_model is None:
+                # Background removal disabled: keep full image, add opaque alpha.
+                output = input.convert('RGBA')
+            else:
+                if self.rembg_model is None:
+                    # Background removal disabled: keep full image, add opaque alpha.
+                    output = input.convert('RGBA')
+                else:
+                    if self.rembg_model is None:
+                        # Background removal disabled: keep full image, add opaque alpha.
+                        output = input.convert('RGBA')
+                    else:
+                        input = input.convert('RGB')
+                        if self.low_vram:
+                            self.rembg_model.to(self.device)
+                        output = self.rembg_model(input)
+                        if self.low_vram:
+                            self.rembg_model.cpu()
         output_np = np.array(output)
         alpha = output_np[:, :, 3]
         bbox = np.argwhere(alpha > 0.8 * 255)
