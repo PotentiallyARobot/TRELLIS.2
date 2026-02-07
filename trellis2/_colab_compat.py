@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-
+from typing import List, Tuple, Optional
 
 def patch_transformers_missing_all_tied_weights_keys() -> None:
     try:
@@ -43,12 +43,6 @@ def patch_transformers_missing_all_tied_weights_keys() -> None:
         PreTrainedModel._move_missing_keys_from_meta_to_device = _trellis2_safe_move_missing_keys_from_meta_to_device
 
     PreTrainedModel._trellis2_hf_patch_applied = True
-
-from __future__ import annotations
-
-import os
-from pathlib import Path
-from typing import List, Tuple, Optional
 
 def download_and_patch_trellis_weights(
     local_dir: str | Path = "/content/trellis2_weights_local",
