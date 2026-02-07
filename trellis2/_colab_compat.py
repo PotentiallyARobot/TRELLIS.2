@@ -44,121 +44,122 @@ def patch_transformers_missing_all_tied_weights_keys() -> None:
 
     PreTrainedModel._trellis2_hf_patch_applied = True
 
-def ensure_patched_weights_snapshot() -> None:
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+def download_and_patch_trellis_weights(
+    local_dir: str | Path = "/content/trellis2_weights_local",
+    src_repo: str = "microsoft/TRELLIS.2-4B",
+    revision: str = "main",
+    old: str = "facebook/dinov3-vitl16-pretrain-lvd1689m",
+    new: str = "kiennt120/dinov3-vitl16-pretrain-lvd1689m",
+    ignore_filenames: tuple[str, ...] = ("_colab_compat.py",),
+    force_redownload: bool = False,
+    force_repatch: bool = False,
+) -> tuple[Path, List[Tuple[str, int]]]:
     """
-    Auto-download a TRELLIS weights snapshot to a local directory and patch text files inside it
-    by replacing a DINO repo id string OLD -> NEW.
+    Downloads the TRELLIS weights snapshot into `local_dir` and patches text files
+    by replacing `old` -> `new`.
 
-    Extra rule: ignore any file named `_colab_compat.py` anywhere in the tree.
+    Returns:
+      (local_dir_path, changed_list)
+        - local_dir_path: Path to the local snapshot directory
+        - changed_list: list of (filepath, count_replacements_in_file)
 
-    Env vars:
-      TRELLIS2_PATCH_WEIGHTS        default "1"  (set "0" to disable)
-      TRELLIS2_FORCE_PATCH_WEIGHTS  default "0"  (set "1" to re-run patch even if marker exists)
-      TRELLIS2_WEIGHTS_REPO         default "microsoft/TRELLIS.2-4B"
-      TRELLIS2_WEIGHTS_DIR          default "~/.cache/trellis2/weights"
-      TRELLIS2_DINO_OLD             default "facebook/dinov3-vitl16-pretrain-lvd1689m"
-      TRELLIS2_DINO_NEW             default "kiennt120/dinov3-vitl16-pretrain-lvd1689m"
-
-    Side effect:
-      Sets TRELLIS2_WEIGHTS_LOCAL_DIR to the patched local directory (if not already set).
+    Behavior:
+      - Uses Hugging Face snapshot_download.
+      - Skips binary-ish extensions.
+      - Skips any file whose name is in ignore_filenames (anywhere in tree).
+      - Writes a marker file so patching is idempotent unless force_repatch=True.
+      - Sets env var TRELLIS2_WEIGHTS_LOCAL_DIR to the snapshot path.
     """
-    if os.getenv("TRELLIS2_PATCH_WEIGHTS", "1") != "1":
-        return
+    # Lazy import so this function can live in your repo without hard dependency at import time
+    from huggingface_hub import snapshot_download
 
-    # Only run once per process
-    if getattr(ensure_patched_weights_snapshot, "_ran", False):
-        return
-
-    # Lazy import so your package can import even if HF hub isn't installed yet.
-    try:
-        from huggingface_hub import snapshot_download
-    except Exception:
-        ensure_patched_weights_snapshot._ran = True
-        return
-
-    repo_id = os.getenv("TRELLIS2_WEIGHTS_REPO", "microsoft/TRELLIS.2-4B")
-    local_dir = Path(
-        os.getenv(
-            "TRELLIS2_WEIGHTS_DIR",
-            str(Path.home() / ".cache" / "trellis2" / "weights"),
-        )
-    ).expanduser()
+    local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
+    print(os.getcwd())
+    marker = "trellis2_weights_local"
+    if marker.exists() and not force_repatch:
+        # Still ensure env var is set, and optionally redownload if requested
+        if force_redownload:
+            snapshot_download(
+                repo_id=src_repo,
+                local_dir=str(local_dir),
+                local_dir_use_symlinks=False,
+                revision=revision,
+                force_download=True,
+            )
+        os.environ.setdefault("TRELLIS2_WEIGHTS_LOCAL_DIR", str(local_dir))
+        return local_dir, []
 
-    old = os.getenv("TRELLIS2_DINO_OLD", "facebook/dinov3-vitl16-pretrain-lvd1689m")
-    new = os.getenv("TRELLIS2_DINO_NEW", "kiennt120/dinov3-vitl16-pretrain-lvd1689m")
-
-    marker = local_dir / ".trellis2_patched_marker"
-    force = os.getenv("TRELLIS2_FORCE_PATCH_WEIGHTS", "0") == "1"
-
-    # Download/refresh snapshot locally
+    print(f"Downloading weights repo locally to: {local_dir}")
     snapshot_download(
-        repo_id=repo_id,
+        repo_id=src_repo,
         local_dir=str(local_dir),
         local_dir_use_symlinks=False,
-        revision="main",
+        revision=revision,
+        force_download=force_redownload,
     )
 
-    # Patch text files once (idempotent)
-    if (not marker.exists()) or force:
-        bin_exts = {
-            ".safetensors", ".bin", ".pt", ".pth",
-            ".png", ".jpg", ".jpeg", ".webp", ".gif",
-            ".mp4", ".mov", ".avi",
-            ".glb", ".gltf", ".fbx", ".obj",
-            ".onnx", ".npz",
-        }
+    bin_exts = {
+        ".safetensors", ".bin", ".pt", ".pth",
+        ".png", ".jpg", ".jpeg", ".webp", ".gif",
+        ".mp4", ".mov", ".avi",
+        ".glb", ".gltf", ".fbx", ".obj",
+        ".onnx", ".npz",
+    }
 
-        modified_files = 0
-        total_replacements = 0
+    def is_text_file(p: Path) -> bool:
+        if p.name in ignore_filenames:
+            return False
+        if p.suffix.lower() in bin_exts:
+            return False
+        return True
 
-        for p in local_dir.rglob("*"):
-            if not p.is_file():
-                continue
+    changed: List[Tuple[str, int]] = []
+    for p in local_dir.rglob("*"):
+        if not p.is_file() or not is_text_file(p):
+            continue
 
-            # Ignore this filename anywhere in the tree
-            if p.name == "_colab_compat.py":
-                continue
+        try:
+            b = p.read_bytes()
+        except Exception:
+            continue
 
-            # Skip obvious binaries
-            if p.suffix.lower() in bin_exts:
-                continue
-
+        # Try utf-8 then latin-1
+        try:
+            t = b.decode("utf-8")
+            enc = "utf-8"
+        except UnicodeDecodeError:
             try:
-                b = p.read_bytes()
+                t = b.decode("latin-1")
+                enc = "latin-1"
             except Exception:
                 continue
 
-            # Decode as utf-8 else latin-1, preserve chosen encoding on write
-            try:
-                t = b.decode("utf-8")
-                enc = "utf-8"
-            except UnicodeDecodeError:
-                try:
-                    t = b.decode("latin-1")
-                    enc = "latin-1"
-                except Exception:
-                    continue
+        if old not in t:
+            continue
 
-            if old not in t:
-                continue
+        c = t.count(old)
+        try:
+            p.write_bytes(t.replace(old, new).encode(enc))
+        except Exception:
+            continue
 
-            c = t.count(old)
-            try:
-                p.write_bytes(t.replace(old, new).encode(enc))
-            except Exception:
-                continue
+        changed.append((str(p), c))
 
-            modified_files += 1
-            total_replacements += c
+    marker.write_text(
+        f"patched: {old} -> {new}\n"
+        f"files_changed: {len(changed)}\n"
+        f"total_replacements: {sum(c for _, c in changed)}\n"
+    )
 
-        marker.write_text(
-            f"patched {old} -> {new}\n"
-            f"modified_files={modified_files}\n"
-            f"total_replacements={total_replacements}\n"
-        )
-
-    # Expose the patched directory for your loader
     os.environ.setdefault("TRELLIS2_WEIGHTS_LOCAL_DIR", str(local_dir))
 
-    ensure_patched_weights_snapshot._ran = True
+    print(f"\nReplaced '{old}' -> '{new}' in {len(changed)} file(s).")
+    return local_dir, changed
+
