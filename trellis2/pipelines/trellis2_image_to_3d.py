@@ -185,7 +185,50 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         output = output[:, :, :3] * output[:, :, 3:4]
         output = Image.fromarray((output * 255).astype(np.uint8))
         return output
-        
+
+    def get_cond_weighted(
+            self,
+            images: List[Image.Image],
+            resolution: int,
+            weights: Optional[List[float]] = None,
+            include_neg_cond: bool = True,
+    ) -> dict:
+        """
+        Extract DINO features for multiple images and reduce (B,N,D) -> (1,N,D)
+        via weighted average over B.
+        """
+        assert len(images) >= 1, "Need at least one image"
+        if weights is None:
+            weights = [1.0 / len(images)] * len(images)
+        assert len(weights) == len(images), "weights must match images length"
+
+        # normalize weights
+        w = torch.tensor(weights, dtype=torch.float32, device=self.device)
+        w = w / w.sum()
+
+        self.image_cond_model.image_size = resolution
+        if self.low_vram:
+            self.image_cond_model.to(self.device)
+
+        # features: (B, N, D)
+        feats = self.image_cond_model(images)
+
+        if self.low_vram:
+            self.image_cond_model.cpu()
+
+        # Ensure weights broadcast to (B,1,1)
+        w = w.view(-1, 1, 1).to(feats.dtype).to(feats.device)
+
+        # (1, N, D)
+        cond = (feats * w).sum(dim=0, keepdim=True)
+
+        if not include_neg_cond:
+            return {"cond": cond}
+
+        neg_cond = torch.zeros_like(cond)
+        return {"cond": cond, "neg_cond": neg_cond}
+
+
     def get_cond(self, image: Union[torch.Tensor, list[Image.Image]], resolution: int, include_neg_cond: bool = True) -> dict:
         """
         Get the conditioning information for the model.
@@ -509,37 +552,42 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 )
             )
         return out_mesh
-    
+
     @torch.no_grad()
     def run(
-        self,
-        image: Image.Image,
-        num_samples: int = 1,
-        seed: int = 42,
-        sparse_structure_sampler_params: dict = {},
-        shape_slat_sampler_params: dict = {},
-        tex_slat_sampler_params: dict = {},
-        preprocess_image: bool = True,
-        return_latent: bool = False,
-        pipeline_type: Optional[str] = None,
-        max_num_tokens: int = 49152,
+            self,
+            image: Union[Image.Image, List[Image.Image]],
+            num_samples: int = 1,
+            seed: int = 42,
+            sparse_structure_sampler_params: dict = {},
+            shape_slat_sampler_params: dict = {},
+            tex_slat_sampler_params: dict = {},
+            preprocess_image: bool = True,
+            return_latent: bool = False,
+            pipeline_type: Optional[str] = None,
+            max_num_tokens: int = 49152,
+            image_weights: Optional[List[float]] = None,
+            tex_image_weights: Optional[List[float]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
 
         Args:
-            image (Image.Image): The image prompt.
-            num_samples (int): The number of samples to generate.
-            seed (int): The random seed.
-            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
-            shape_slat_sampler_params (dict): Additional parameters for the shape SLat sampler.
-            tex_slat_sampler_params (dict): Additional parameters for the texture SLat sampler.
-            preprocess_image (bool): Whether to preprocess the image.
-            return_latent (bool): Whether to return the latent codes.
-            pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
-            max_num_tokens (int): The maximum number of tokens to use.
+            image: A single PIL image or a list of PIL images (multi-view).
+            num_samples: Number of 3D samples to generate.
+            seed: RNG seed.
+            sparse_structure_sampler_params: Overrides for sparse structure sampler.
+            shape_slat_sampler_params: Overrides for shape sampler.
+            tex_slat_sampler_params: Overrides for texture sampler.
+            preprocess_image: Whether to preprocess each image.
+            return_latent: Whether to return (shape_slat, tex_slat, res) along with meshes.
+            pipeline_type: '512', '1024', '1024_cascade', '1536_cascade' or None for default.
+            max_num_tokens: Max tokens for cascade.
+            image_weights: Weights for multi-image conditioning used for sparse+shape (and also texture if tex_image_weights is None).
+            tex_image_weights: Optional separate weights for texture conditioning.
         """
-        # Check pipeline type
+
+        # ---- Validate pipeline type ----
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '512':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
@@ -557,37 +605,57 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
         else:
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
-        
+
+        # ---- Normalize inputs ----
+        images: List[Image.Image] = image if isinstance(image, list) else [image]
+        if len(images) == 0:
+            raise ValueError("No images provided.")
+
         if preprocess_image:
-            image = self.preprocess_image(image)
+            images = [self.preprocess_image(im) for im in images]
+
+        # ---- Conditioning (weighted multi-view) ----
         torch.manual_seed(seed)
-        cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+
+        # Shape/sparse conditioning uses image_weights (or equal if None)
+        cond_512 = self.get_cond_weighted(images, 512, weights=image_weights)
+        cond_1024 = self.get_cond_weighted(images, 1024, weights=image_weights) if pipeline_type != '512' else None
+
+        # Texture conditioning can optionally use separate weights
+        tex_w = tex_image_weights if tex_image_weights is not None else image_weights
+        tex_cond_512 = self.get_cond_weighted(images, 512, weights=tex_w) if pipeline_type == '512' else None
+        tex_cond_1024 = self.get_cond_weighted(images, 1024, weights=tex_w) if pipeline_type != '512' else None
+
+        # ---- Sparse structure ----
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
             cond_512, ss_res,
             num_samples, sparse_structure_sampler_params
         )
+
+        # ---- Shape + Texture ----
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(
                 cond_512, self.models['shape_slat_flow_model_512'],
                 coords, shape_slat_sampler_params
             )
             tex_slat = self.sample_tex_slat(
-                cond_512, self.models['tex_slat_flow_model_512'],
+                tex_cond_512, self.models['tex_slat_flow_model_512'],
                 shape_slat, tex_slat_sampler_params
             )
             res = 512
+
         elif pipeline_type == '1024':
             shape_slat = self.sample_shape_slat(
                 cond_1024, self.models['shape_slat_flow_model_1024'],
                 coords, shape_slat_sampler_params
             )
             tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
+                tex_cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
             res = 1024
+
         elif pipeline_type == '1024_cascade':
             shape_slat, res = self.sample_shape_slat_cascade(
                 cond_512, cond_1024,
@@ -597,9 +665,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 max_num_tokens
             )
             tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
+                tex_cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
+
         elif pipeline_type == '1536_cascade':
             shape_slat, res = self.sample_shape_slat_cascade(
                 cond_512, cond_1024,
@@ -609,12 +678,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 max_num_tokens
             )
             tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
+                tex_cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
+
+        # ---- Decode ----
         torch.cuda.empty_cache()
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
-        else:
-            return out_mesh
+        return out_mesh
