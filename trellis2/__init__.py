@@ -11,22 +11,26 @@ from ._colab_compat import (
 )
 
 patch_transformers_missing_all_tied_weights_keys()
-# --- PATCH: provide a default all_tied_weights_keys for remote models that don't define it ---
 import torch
 
-if not hasattr(torch.nn.Module, "_patched_all_tied_weights_keys"):
-    torch.nn.Module._patched_all_tied_weights_keys = True
+def patch_all_tied_weights_keys():
+    # If some earlier patch (or package) installed a read-only @property on Module,
+    # transformers will crash when it tries: self.all_tied_weights_keys = ...
+    attr = getattr(torch.nn.Module, "all_tied_weights_keys", None)
 
-    @property
-    def _all_tied_weights_keys_default(self):
-        # Transformers expects a dict-like with .keys(); empty means "no tied weights"
-        return {}
+    # If it's a property (no setter), remove it
+    if isinstance(attr, property):
+        try:
+            delattr(torch.nn.Module, "all_tied_weights_keys")
+        except Exception:
+            pass
 
-    # Only define it if the attribute truly doesn't exist on the instance/class
-    # By attaching to Module, any custom model (including remote ones) inherits it.
-    setattr(torch.nn.Module, "all_tied_weights_keys", _all_tied_weights_keys_default)
+    # Ensure the class has a writable default (instance assignment will override it)
+    # Use an immutable default so we don't accidentally share a mutable dict.
+    if not hasattr(torch.nn.Module, "all_tied_weights_keys"):
+        torch.nn.Module.all_tied_weights_keys = ()
 
-# --- END PATCH ---
+patch_all_tied_weights_keys()
 
 from huggingface_hub import snapshot_download
 from pathlib import Path
