@@ -3,88 +3,21 @@
 #
 # Upload 1 or more images. Each is fully processed before the
 # next one starts. No threads, no parallelism, no VRAM contention.
-#
-#   For each image:
-#     1. Reconstruct (pipe.run)
-#     2. Render snapshot (optional)
-#     3. Offload models → CPU
-#     4. Prepare mesh (remesh/simplify/BVH)
-#     5. xatlas UV unwrap
-#     6. Texture bake + GLB export
-#     7. Full cleanup
-#     8. Reload models → GPU (if more images)
-#
 # ============================================================
-import os, sys
+import os, sys, time, re, gc, traceback, pathlib, shutil
+
+import torch
+import numpy as np
+from PIL import Image
+import cv2, imageio
+
 sys.path.append("/content/TRELLIS.2")
 
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.utils import render_utils
 from trellis2.renderers import EnvMap
 import o_voxel
-
-# ── Upload ──
-from google.colab import files as colab_files
-import pathlib, shutil
-
-print("📂 Upload your image(s):")
-uploaded = colab_files.upload()
-if not uploaded:
-    raise SystemExit("No files uploaded.")
-
-INPUT_DIR = pathlib.Path("/content/images_in")
-if INPUT_DIR.exists():
-    shutil.rmtree(INPUT_DIR)
-INPUT_DIR.mkdir()
-# Write from upload bytes — strip Colab's " (1)" duplicate suffix
-import re
-for name, data in uploaded.items():
-    clean = re.sub(r'\s*\(\d+\)(?=\.\w+$)', '', pathlib.Path(name).name)
-    (INPUT_DIR / clean).write_bytes(data)
-print(f"✅ {len(uploaded)} image(s) uploaded")
-
-# ══════════════════════════════════════════════════════════════
-# CONFIG
-# ══════════════════════════════════════════════════════════════
-
-PRESET = "max_quality"   # "max_quality" | "balanced" | "fast"
-
-PRESETS = {
-    "max_quality": dict(
-        ss_steps=12, shape_steps=12, tex_steps=12,
-        texture_size=4096, decimate_target=1_000_000,
-        remesh=True, remesh_band=1.0,
-        render_mode="snapshot",   # "video" | "snapshot" | "none"
-        video_resolution=512,
-    ),
-    "balanced": dict(
-        ss_steps=8, shape_steps=8, tex_steps=8,
-        texture_size=2048, decimate_target=500_000,
-        remesh=True, remesh_band=1.0,
-        render_mode="snapshot",
-        video_resolution=512,
-    ),
-    "fast": dict(
-        ss_steps=8, shape_steps=8, tex_steps=8,
-        texture_size=2048, decimate_target=500_000,
-        remesh=False, remesh_band=1.0,
-        render_mode="none",
-        video_resolution=512,
-    ),
-}
-
-CFG = PRESETS[PRESET]
-OUTPUT_DIR = pathlib.Path("/content/drive/MyDrive/trellis_batch_output")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# ══════════════════════════════════════════════════════════════
-# IMPORTS
-# ══════════════════════════════════════════════════════════════
-
-import time, re, gc, traceback
-import torch, numpy as np
-from PIL import Image
-import cv2, imageio
+import postprocess_parallel as pp
 
 os.environ["TRELLIS2_DISABLE_REMBG"] = "1"
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
@@ -98,54 +31,48 @@ if "/content" not in sys.path:
 
 torch.set_float32_matmul_precision("high")
 
-GPU_NAME = torch.cuda.get_device_name(0)
-TOTAL_VRAM = torch.cuda.get_device_properties(0).total_memory / 1e9
-
-print("=" * 60)
-print(f" GPU: {GPU_NAME} | VRAM: {TOTAL_VRAM:.1f} GB")
-print(f" Preset: {PRESET}")
-print("=" * 60)
-
-import postprocess_parallel as pp
 
 # ══════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════
 
-def safe_stem(name):
+def _safe_stem(name):
     s = pathlib.Path(name).stem.strip()
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"[^A-Za-z0-9._-]+", "", s)
     return s or "image"
 
-def fmt_bytes(n):
+
+def _fmt_bytes(n):
     for u in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {u}"
         n /= 1024
     return f"{n:.1f} TB"
 
-def cleanup():
+
+def _cleanup():
     gc.collect()
     try:
         torch.cuda.empty_cache()
     except RuntimeError:
-        pass  # CUDA context may be poisoned — skip silently
+        pass
     gc.collect()
 
-def vram_free():
-    return TOTAL_VRAM - torch.cuda.memory_allocated() / 1e9
 
-def cuda_ok():
-    """Check if CUDA context is still healthy."""
+def _vram_free(total_vram):
+    return total_vram - torch.cuda.memory_allocated() / 1e9
+
+
+def _cuda_ok():
     try:
         torch.cuda.synchronize()
         return True
     except RuntimeError:
         return False
 
-def safe_offload():
-    """Move models to CPU, tolerating a poisoned CUDA context."""
+
+def _safe_offload(pipe):
     for _, model in pipe.models.items():
         try:
             model.to("cpu")
@@ -155,256 +82,426 @@ def safe_offload():
         pipe.image_cond_model.to("cpu")
     except RuntimeError:
         pass
-    cleanup()
+    _cleanup()
 
-# Max faces for render — above this the nvdiffrec renderer can trigger
-# illegal memory access which poisons the entire CUDA context.
-RENDER_MAX_FACES = 16_000_000
 
 # ══════════════════════════════════════════════════════════════
-# LOAD PIPELINE
+# MAIN FUNCTION
 # ══════════════════════════════════════════════════════════════
 
-print("\n🔧 Loading pipeline (low_vram)...")
-pipe = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-pipe.low_vram = True
-pipe.cuda()
+def run_trellis2_batch(
+    # ── Input / Output ──
+    input_dir: str = "/content/images_in",
+    output_dir: str = "/content/drive/MyDrive/trellis_batch_output",
+    upload_images: bool = True,
 
-hdri = REPO_DIR / "assets" / "hdri" / "forest.exr"
-envmap = EnvMap(torch.tensor(
-    cv2.cvtColor(cv2.imread(str(hdri), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-    dtype=torch.float32, device="cuda",
-))
-print(f"✅ Pipeline loaded | alloc={torch.cuda.memory_allocated()/1e9:.2f}GB")
+    # ── Pipeline ──
+    model_name: str = "microsoft/TRELLIS.2-4B",
+    low_vram: bool = True,
+    hdri_path: str | None = None,
 
-# ══════════════════════════════════════════════════════════════
-# GATHER IMAGES
-# ══════════════════════════════════════════════════════════════
+    # ── Sampler steps ──
+    ss_steps: int = 12,
+    shape_steps: int = 12,
+    tex_steps: int = 12,
 
-exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-all_images = sorted(f for f in INPUT_DIR.iterdir() if f.suffix.lower() in exts)
-already_done = {f.stem for f in OUTPUT_DIR.glob("*.glb")}
-images = [f for f in all_images if safe_stem(f.name) not in already_done]
+    # ── Mesh / Texture ──
+    texture_size: int = 4096,
+    decimate_target: int = 1_000_000,
+    remesh: bool = True,
+    remesh_band: float = 1.0,
 
-print(f"\n📂 Output: {OUTPUT_DIR}")
-print(f"✅ {len(all_images)} image(s), {len(already_done)} already done, {len(images)} to process")
+    # ── Render ──
+    render_mode: str = "snapshot",      # "video" | "snapshot" | "none"
+    video_resolution: int = 512,
+    video_num_frames: int = 120,
+    video_fps: int = 15,
+    render_max_faces: int = 16_000_000,
 
-if not images:
-    print("\n✅ All images already processed!")
-    raise SystemExit()
+    # ── Retry ──
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
 
-for i, f in enumerate(images, 1):
-    print(f"   {i}. {f.name} ({f.stat().st_size // 1024} KB)")
+    # ── Misc ──
+    skip_already_done: bool = True,
+    verbose: bool = True,
+):
+    """
+    Process one or more images through the TRELLIS.2 pipeline, producing
+    textured GLB meshes.
 
-print(f"\n⚙  Texture: {CFG['texture_size']}px | Decimate: {CFG['decimate_target']:,} | Remesh: {CFG['remesh']}")
+    Parameters
+    ----------
+    input_dir : str
+        Directory containing input images (png/jpg/jpeg/webp/bmp).
+    output_dir : str
+        Directory where GLB files (and optional previews) are saved.
+    upload_images : bool
+        If True, trigger a Colab file-upload dialog to populate input_dir.
+    model_name : str
+        HuggingFace model identifier for the Trellis2 pipeline.
+    low_vram : bool
+        Enable low-VRAM mode (offloads models between stages).
+    hdri_path : str | None
+        Path to an HDRI .exr for the environment map. Defaults to the
+        bundled forest.exr.
+    ss_steps : int
+        Sparse-structure sampler steps.
+    shape_steps : int
+        Shape SLAT sampler steps.
+    tex_steps : int
+        Texture SLAT sampler steps.
+    texture_size : int
+        Baked texture resolution in pixels (e.g. 2048, 4096).
+    decimate_target : int
+        Target face count after decimation.
+    remesh : bool
+        Whether to apply remeshing before UV unwrap.
+    remesh_band : float
+        Remesh band width parameter.
+    render_mode : str
+        "video" → full turntable MP4, "snapshot" → single preview PNG,
+        "none" → skip rendering entirely.
+    video_resolution : int
+        Resolution for rendered video/snapshot frames.
+    video_num_frames : int
+        Number of frames for turntable video.
+    video_fps : int
+        FPS for turntable video.
+    render_max_faces : int
+        Skip rendering if face count exceeds this (avoids CUDA crashes).
+    max_retries : int
+        Number of attempts per image before marking as failed.
+    retry_delay : float
+        Seconds to wait between retries.
+    skip_already_done : bool
+        If True, skip images whose GLB already exists in output_dir.
+    verbose : bool
+        Print detailed progress information.
 
-# ══════════════════════════════════════════════════════════════
-# PROCESS EACH IMAGE — fully sequential, no parallelism
-# ══════════════════════════════════════════════════════════════
+    Returns
+    -------
+    list[dict]
+        One dict per image with keys: name, recon, render, prepare,
+        xatlas, bake, total, size, error.
+    """
 
-MAX_RETRIES = 3
-t_total = time.perf_counter()
-results = []
+    # ── GPU info ──
+    gpu_name = torch.cuda.get_device_name(0)
+    total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
 
-for idx, img_path in enumerate(images):
-    base = safe_stem(img_path.name)
-    print(f"\n{'━' * 60}")
-    print(f"[{idx+1}/{len(images)}] {img_path.name}")
-    print(f"{'━' * 60}")
+    if verbose:
+        print("=" * 60)
+        print(f" GPU: {gpu_name} | VRAM: {total_vram:.1f} GB")
+        print("=" * 60)
 
-    t_img = time.perf_counter()
-    error = None
+    # ── Upload (Colab) ──
+    input_dir = pathlib.Path(input_dir)
+    output_dir = pathlib.Path(output_dir)
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            # ── 1. Reconstruct ──
-            cleanup()
-            image = Image.open(img_path).convert("RGBA")
+    if upload_images:
+        from google.colab import files as colab_files
+        print("📂 Upload your image(s):")
+        uploaded = colab_files.upload()
+        if not uploaded:
+            raise SystemExit("No files uploaded.")
+        if input_dir.exists():
+            shutil.rmtree(input_dir)
+        input_dir.mkdir(parents=True, exist_ok=True)
+        for name, data in uploaded.items():
+            clean = re.sub(r'\s*\(\d+\)(?=\.\w+$)', '', pathlib.Path(name).name)
+            (input_dir / clean).write_bytes(data)
+        if verbose:
+            print(f"✅ {len(uploaded)} image(s) uploaded")
+    else:
+        if not input_dir.exists():
+            raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
 
-            if attempt > 0:
-                print(f"  🔄 Attempt {attempt+1}/{MAX_RETRIES} — reloading models...")
-                pipe.cuda()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-            print(f"  ▸ Reconstructing...")
-            t0 = time.perf_counter()
-            out = pipe.run(
-                [image], image_weights=[1.0],
-                sparse_structure_sampler_params={"steps": CFG["ss_steps"]},
-                shape_slat_sampler_params={"steps": CFG["shape_steps"]},
-                tex_slat_sampler_params={"steps": CFG["tex_steps"]},
-            )
-            if not out:
-                raise RuntimeError("Empty pipeline result")
-            mesh = out[0]
+    # ── Load pipeline ──
+    if verbose:
+        print("\n🔧 Loading pipeline...")
+    pipe = Trellis2ImageTo3DPipeline.from_pretrained(model_name)
+    pipe.low_vram = low_vram
+    pipe.cuda()
 
-            # Clone tensors — cumesh can lose storage references
-            mesh.vertices = mesh.vertices.clone()
-            mesh.faces = mesh.faces.clone()
-            if hasattr(mesh, 'attrs') and mesh.attrs is not None:
-                mesh.attrs = mesh.attrs.clone()
-            if hasattr(mesh, 'coords') and mesh.coords is not None:
-                mesh.coords = mesh.coords.clone()
+    hdri = pathlib.Path(hdri_path) if hdri_path else REPO_DIR / "assets" / "hdri" / "forest.exr"
+    envmap = EnvMap(torch.tensor(
+        cv2.cvtColor(cv2.imread(str(hdri), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
+        dtype=torch.float32, device="cuda",
+    ))
+    if verbose:
+        print(f"✅ Pipeline loaded | alloc={torch.cuda.memory_allocated()/1e9:.2f}GB")
 
-            recon_s = round(time.perf_counter() - t0, 2)
-            peak = torch.cuda.max_memory_allocated() / 1e9
-            torch.cuda.reset_peak_memory_stats()
-            print(f"  ✓ Recon: {recon_s}s | peak: {peak:.1f}GB | "
-                  f"{mesh.vertices.shape[0]:,} verts, {mesh.faces.shape[0]:,} faces")
+    # ── Gather images ──
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    all_images = sorted(f for f in input_dir.iterdir() if f.suffix.lower() in exts)
 
-            # ── 2. Render snapshot (optional, non-fatal) ──
-            render_s = 0
-            n_faces = mesh.faces.shape[0]
-            if CFG["render_mode"] != "none" and n_faces <= RENDER_MAX_FACES:
-                try:
-                    t0 = time.perf_counter()
-                    if CFG["render_mode"] == "video":
-                        result = render_utils.render_video(
-                            mesh, envmap=envmap,
-                            resolution=CFG["video_resolution"],
-                            num_frames=120,
-                        )
-                        frames = render_utils.make_pbr_vis_frames(
-                            result, resolution=CFG["video_resolution"]
-                        )
-                        imageio.mimsave(str(OUTPUT_DIR / f"{base}.mp4"), frames, fps=15)
-                        del frames, result
-                    elif CFG["render_mode"] == "snapshot":
-                        result = render_utils.render_video(
-                            mesh, envmap=envmap,
-                            resolution=CFG["video_resolution"],
-                            num_frames=1,
-                        )
-                        frame = render_utils.make_pbr_vis_frames(
-                            result, resolution=CFG["video_resolution"]
-                        )[0]
-                        Image.fromarray(frame).save(str(OUTPUT_DIR / f"{base}_preview.png"))
-                        del frame, result
-                    render_s = round(time.perf_counter() - t0, 2)
-                    print(f"  ✓ Render: {render_s}s")
-                except Exception as e:
-                    print(f"  ⚠  Render failed (non-fatal): {e}")
-                    # Check if CUDA context is poisoned (illegal memory access)
-                    if not cuda_ok():
-                        print(f"  ⚠  CUDA context corrupted by render — must retry from scratch")
-                        raise RuntimeError("CUDA context corrupted after render failure")
-            elif n_faces > RENDER_MAX_FACES:
-                print(f"  ⚠  Skipping render ({n_faces:,} faces > {RENDER_MAX_FACES:,} limit)")
+    if skip_already_done:
+        already_done = {f.stem for f in output_dir.glob("*.glb")}
+        images = [f for f in all_images if _safe_stem(f.name) not in already_done]
+    else:
+        already_done = set()
+        images = list(all_images)
 
-            # ── 3. Offload models → CPU ──
-            del out
-            safe_offload()
-            print(f"  ✓ Models offloaded | {vram_free():.1f}GB free")
+    if verbose:
+        print(f"\n📂 Output: {output_dir}")
+        print(f"✅ {len(all_images)} image(s), {len(already_done)} already done, {len(images)} to process")
+        print(f"⚙  Texture: {texture_size}px | Decimate: {decimate_target:,} | Remesh: {remesh}")
+        for i, f in enumerate(images, 1):
+            print(f"   {i}. {f.name} ({f.stat().st_size // 1024} KB)")
 
-            # ── 4. Prepare mesh ──
-            print(f"  ▸ Preparing mesh (remesh={CFG['remesh']})...")
-            t0 = time.perf_counter()
-            prepared = pp.prepare_mesh(
-                vertices=mesh.vertices,
-                faces=mesh.faces,
-                attr_volume=mesh.attrs,
-                coords=mesh.coords,
-                attr_layout=mesh.layout,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                voxel_size=mesh.voxel_size,
-                decimation_target=CFG["decimate_target"],
-                texture_size=CFG["texture_size"],
-                remesh=CFG["remesh"],
-                remesh_band=CFG.get("remesh_band", 1.0),
-                verbose=True,
-                name=base,
-            )
-            prepare_s = round(time.perf_counter() - t0, 2)
-            print(f"  ✓ Prepare: {prepare_s}s")
-            del mesh
+    if not images:
+        print("\n✅ All images already processed!")
+        return []
 
-            # ── 5. xatlas UV unwrap ──
-            print(f"  ▸ UV unwrapping (xatlas)...")
-            t0 = time.perf_counter()
-            unwrapped = pp.uv_unwrap(prepared, verbose=True)
-            xatlas_s = round(time.perf_counter() - t0, 2)
-            print(f"  ✓ xatlas: {xatlas_s}s")
-            del prepared
+    # ── Process each image ──
+    t_total = time.perf_counter()
+    results = []
 
-            # ── 6. Texture bake + GLB export ──
-            glb_path = OUTPUT_DIR / f"{base}.glb"
-            print(f"  ▸ Baking textures + exporting GLB...")
-            t0 = time.perf_counter()
-            pp.bake_and_export(unwrapped, str(glb_path), verbose=True)
-            bake_s = round(time.perf_counter() - t0, 2)
-            glb_size = glb_path.stat().st_size
-            print(f"  ✓ Bake: {bake_s}s | GLB: {fmt_bytes(glb_size)}")
-            del unwrapped
+    for idx, img_path in enumerate(images):
+        base = _safe_stem(img_path.name)
+        if verbose:
+            print(f"\n{'━' * 60}")
+            print(f"[{idx+1}/{len(images)}] {img_path.name}")
+            print(f"{'━' * 60}")
 
-            # ── Done ──
-            total_s = round(time.perf_counter() - t_img, 2)
-            results.append(dict(
-                name=base, recon=recon_s, render=render_s,
-                prepare=prepare_s, xatlas=xatlas_s, bake=bake_s,
-                total=total_s, size=glb_size, error=None,
-            ))
-            print(f"\n  ✅ {base} done in {total_s}s")
-            error = None
-            break  # success — exit retry loop
+        t_img = time.perf_counter()
+        error = None
 
-        except Exception as e:
-            err = str(e).lower()
-            retryable = ("storage" in err or "out of memory" in err
-                         or "illegal memory" in err or "cuda error" in err
-                         or "accelerator" in err)
-            if attempt < MAX_RETRIES - 1 and retryable:
-                print(f"  ⚠  Attempt {attempt+1} failed: {e}")
-                print(f"  🔄 Cleaning up and retrying...")
-                try: del out
-                except: pass
-                try: del mesh
-                except: pass
-                try: del prepared
-                except: pass
-                try: del unwrapped
-                except: pass
-                safe_offload()
-                time.sleep(2)
-            else:
-                error = str(e)
+        for attempt in range(max_retries):
+            try:
+                # ── 1. Reconstruct ──
+                _cleanup()
+                image = Image.open(img_path).convert("RGBA")
+
+                if attempt > 0:
+                    if verbose:
+                        print(f"  🔄 Attempt {attempt+1}/{max_retries} — reloading models...")
+                    pipe.cuda()
+
+                if verbose:
+                    print(f"  ▸ Reconstructing...")
+                t0 = time.perf_counter()
+                out = pipe.run(
+                    [image], image_weights=[1.0],
+                    sparse_structure_sampler_params={"steps": ss_steps},
+                    shape_slat_sampler_params={"steps": shape_steps},
+                    tex_slat_sampler_params={"steps": tex_steps},
+                )
+                if not out:
+                    raise RuntimeError("Empty pipeline result")
+                mesh = out[0]
+
+                mesh.vertices = mesh.vertices.clone()
+                mesh.faces = mesh.faces.clone()
+                if hasattr(mesh, 'attrs') and mesh.attrs is not None:
+                    mesh.attrs = mesh.attrs.clone()
+                if hasattr(mesh, 'coords') and mesh.coords is not None:
+                    mesh.coords = mesh.coords.clone()
+
+                recon_s = round(time.perf_counter() - t0, 2)
+                peak = torch.cuda.max_memory_allocated() / 1e9
+                torch.cuda.reset_peak_memory_stats()
+                if verbose:
+                    print(f"  ✓ Recon: {recon_s}s | peak: {peak:.1f}GB | "
+                          f"{mesh.vertices.shape[0]:,} verts, {mesh.faces.shape[0]:,} faces")
+
+                # ── 2. Render (optional, non-fatal) ──
+                render_s = 0
+                n_faces = mesh.faces.shape[0]
+                if render_mode != "none" and n_faces <= render_max_faces:
+                    try:
+                        t0 = time.perf_counter()
+                        if render_mode == "video":
+                            result = render_utils.render_video(
+                                mesh, envmap=envmap,
+                                resolution=video_resolution,
+                                num_frames=video_num_frames,
+                            )
+                            frames = render_utils.make_pbr_vis_frames(
+                                result, resolution=video_resolution
+                            )
+                            imageio.mimsave(str(output_dir / f"{base}.mp4"), frames, fps=video_fps)
+                            del frames, result
+                        elif render_mode == "snapshot":
+                            result = render_utils.render_video(
+                                mesh, envmap=envmap,
+                                resolution=video_resolution,
+                                num_frames=1,
+                            )
+                            frame = render_utils.make_pbr_vis_frames(
+                                result, resolution=video_resolution
+                            )[0]
+                            Image.fromarray(frame).save(str(output_dir / f"{base}_preview.png"))
+                            del frame, result
+                        render_s = round(time.perf_counter() - t0, 2)
+                        if verbose:
+                            print(f"  ✓ Render: {render_s}s")
+                    except Exception as e:
+                        if verbose:
+                            print(f"  ⚠  Render failed (non-fatal): {e}")
+                        if not _cuda_ok():
+                            if verbose:
+                                print(f"  ⚠  CUDA context corrupted — must retry")
+                            raise RuntimeError("CUDA context corrupted after render failure")
+                elif n_faces > render_max_faces and verbose:
+                    print(f"  ⚠  Skipping render ({n_faces:,} faces > {render_max_faces:,} limit)")
+
+                # ── 3. Offload models → CPU ──
+                del out
+                _safe_offload(pipe)
+                if verbose:
+                    print(f"  ✓ Models offloaded | {_vram_free(total_vram):.1f}GB free")
+
+                # ── 4. Prepare mesh ──
+                if verbose:
+                    print(f"  ▸ Preparing mesh (remesh={remesh})...")
+                t0 = time.perf_counter()
+                prepared = pp.prepare_mesh(
+                    vertices=mesh.vertices,
+                    faces=mesh.faces,
+                    attr_volume=mesh.attrs,
+                    coords=mesh.coords,
+                    attr_layout=mesh.layout,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    voxel_size=mesh.voxel_size,
+                    decimation_target=decimate_target,
+                    texture_size=texture_size,
+                    remesh=remesh,
+                    remesh_band=remesh_band,
+                    verbose=verbose,
+                    name=base,
+                )
+                prepare_s = round(time.perf_counter() - t0, 2)
+                if verbose:
+                    print(f"  ✓ Prepare: {prepare_s}s")
+                del mesh
+
+                # ── 5. xatlas UV unwrap ──
+                if verbose:
+                    print(f"  ▸ UV unwrapping (xatlas)...")
+                t0 = time.perf_counter()
+                unwrapped = pp.uv_unwrap(prepared, verbose=verbose)
+                xatlas_s = round(time.perf_counter() - t0, 2)
+                if verbose:
+                    print(f"  ✓ xatlas: {xatlas_s}s")
+                del prepared
+
+                # ── 6. Texture bake + GLB export ──
+                glb_path = output_dir / f"{base}.glb"
+                if verbose:
+                    print(f"  ▸ Baking textures + exporting GLB...")
+                t0 = time.perf_counter()
+                pp.bake_and_export(unwrapped, str(glb_path), verbose=verbose)
+                bake_s = round(time.perf_counter() - t0, 2)
+                glb_size = glb_path.stat().st_size
+                if verbose:
+                    print(f"  ✓ Bake: {bake_s}s | GLB: {_fmt_bytes(glb_size)}")
+                del unwrapped
+
+                # ── Done ──
+                total_s = round(time.perf_counter() - t_img, 2)
+                results.append(dict(
+                    name=base, recon=recon_s, render=render_s,
+                    prepare=prepare_s, xatlas=xatlas_s, bake=bake_s,
+                    total=total_s, size=glb_size, error=None,
+                ))
+                if verbose:
+                    print(f"\n  ✅ {base} done in {total_s}s")
+                error = None
                 break
 
-    if error:
-        total_s = round(time.perf_counter() - t_img, 2)
-        results.append(dict(name=base, total=total_s, error=error,
-                            recon=0, render=0, prepare=0, xatlas=0, bake=0, size=0))
-        print(f"\n  ❌ {base} failed: {error}")
-        traceback.print_exc()
+            except Exception as e:
+                err = str(e).lower()
+                retryable = ("storage" in err or "out of memory" in err
+                             or "illegal memory" in err or "cuda error" in err
+                             or "accelerator" in err)
+                if attempt < max_retries - 1 and retryable:
+                    if verbose:
+                        print(f"  ⚠  Attempt {attempt+1} failed: {e}")
+                        print(f"  🔄 Cleaning up and retrying...")
+                    for var in ('out', 'mesh', 'prepared', 'unwrapped'):
+                        try: del locals()[var]
+                        except: pass
+                    _safe_offload(pipe)
+                    time.sleep(retry_delay)
+                else:
+                    error = str(e)
+                    break
 
-    # ── Full cleanup between images ──
-    safe_offload()
+        if error:
+            total_s = round(time.perf_counter() - t_img, 2)
+            results.append(dict(name=base, total=total_s, error=error,
+                                recon=0, render=0, prepare=0, xatlas=0, bake=0, size=0))
+            if verbose:
+                print(f"\n  ❌ {base} failed: {error}")
+                traceback.print_exc()
+
+        _safe_offload(pipe)
+
+    # ── Results summary ──
+    wall = round(time.perf_counter() - t_total, 2)
+    ok = [r for r in results if not r["error"]]
+    fail = [r for r in results if r["error"]]
+
+    if verbose:
+        print(f"\n{'=' * 60}")
+        print("📊 RESULTS")
+        print(f"{'=' * 60}")
+        print(f"  Done: {len(ok)}/{len(results)}" + (f" ({len(fail)} failed)" if fail else ""))
+        print(f"  Wall: {wall}s ({wall/60:.1f}m)")
+        if ok:
+            print(f"\n{'─' * 75}")
+            print(f"  {'File':<35} {'Recon':>6} {'Prep':>6} {'xatlas':>7} {'Bake':>6} {'Total':>7}")
+            print(f"  {'─' * 69}")
+            for r in ok:
+                n = r['name'][:32] + '..' if len(r['name']) > 34 else r['name']
+                print(f"  {n:<35} {r['recon']:5.0f}s {r['prepare']:5.0f}s {r['xatlas']:6.0f}s {r['bake']:5.0f}s {r['total']:6.0f}s ✅")
+        for r in fail:
+            print(f"  {r['name']:<35} {'':>6} {'':>6} {'':>7} {'':>6} {r['total']:6.0f}s ❌ {r['error'][:30]}")
+        print(f"\n📁 {output_dir}")
+        for f in sorted(output_dir.glob("*")):
+            print(f"   {f.name}  ({_fmt_bytes(f.stat().st_size)})")
+        print(f"\n✅ Done in {wall}s")
+
+    return results
+
 
 # ══════════════════════════════════════════════════════════════
-# RESULTS
+# SAMPLE CALLS
 # ══════════════════════════════════════════════════════════════
 
-wall = round(time.perf_counter() - t_total, 2)
-ok = [r for r in results if not r["error"]]
-fail = [r for r in results if r["error"]]
+# # ── Max quality (default) ──
+# results = run_trellis2_batch(
+#     input_dir="/content/images_in",
+#     output_dir="/content/drive/MyDrive/trellis_batch_output",
+#     upload_images=True,
+#     model_name="microsoft/TRELLIS.2-4B",
+#     low_vram=True,
+#     hdri_path=None,                   # uses bundled forest.exr
+#     ss_steps=12,
+#     shape_steps=12,
+#     tex_steps=12,
+#     texture_size=4096,
+#     decimate_target=1_000_000,
+#     remesh=True,
+#     remesh_band=1.0,
+#     render_mode="snapshot",           # "video" | "snapshot" | "none"
+#     video_resolution=512,
+#     video_num_frames=120,
+#     video_fps=15,
+#     render_max_faces=16_000_000,
+#     max_retries=3,
+#     retry_delay=2.0,
+#     skip_already_done=True,
+#     verbose=True,
+# )
 
-print(f"\n{'=' * 60}")
-print("📊 RESULTS")
-print(f"{'=' * 60}")
-print(f"  Done: {len(ok)}/{len(results)}" + (f" ({len(fail)} failed)" if fail else ""))
-print(f"  Wall: {wall}s ({wall/60:.1f}m)")
-
-if ok:
-    print(f"\n{'─' * 75}")
-    print(f"  {'File':<35} {'Recon':>6} {'Prep':>6} {'xatlas':>7} {'Bake':>6} {'Total':>7}")
-    print(f"  {'─' * 69}")
-    for r in ok:
-        n = r['name'][:32] + '..' if len(r['name']) > 34 else r['name']
-        print(f"  {n:<35} {r['recon']:5.0f}s {r['prepare']:5.0f}s {r['xatlas']:6.0f}s {r['bake']:5.0f}s {r['total']:6.0f}s ✅")
-
-for r in fail:
-    print(f"  {r['name']:<35} {'':>6} {'':>6} {'':>7} {'':>6} {r['total']:6.0f}s ❌ {r['error'][:30]}")
-
-print(f"\n📁 {OUTPUT_DIR}")
-for f in sorted(OUTPUT_DIR.glob("*")):
-    print(f"   {f.name}  ({fmt_bytes(f.stat().st_size)})")
-
-print(f"\n✅ Done in {wall}s")
+# # ── Fast preset equivalent ──
+# results = run_trellis2_batch(
+#     ss_steps=8, shape_steps=8, tex_steps=8,
+#     texture_size=2048, decimate_target=500_000,
+#     remesh=False, render_mode="snapshot",
+# )
