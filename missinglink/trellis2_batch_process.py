@@ -17,7 +17,7 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.utils import render_utils
 from trellis2.renderers import EnvMap
 import o_voxel
-import postprocess_parallel as pp
+import missinglink.postprocess_parallel as pp
 
 os.environ["TRELLIS2_DISABLE_REMBG"] = "1"
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
