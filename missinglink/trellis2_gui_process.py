@@ -16,6 +16,23 @@
 # ============================================================
 
 def run_gui():
+    # ============================================================
+    # 🔺 TRELLIS.2 — 2D to 3D Generator + Background Removal
+    # Single cell: loads pipeline, launches custom web UI.
+    #
+    # Render modes:
+    #   - none:        Skip rendering entirely (fastest)
+    #   - snapshot:    Single-frame PNG (4 angles, PBR grid)
+    #   - video:       120-frame MP4 with bobbing camera + PBR grid
+    #   - perspective: Clean 360° turntable MP4 (shaded only, fixed pitch)
+    #   - rts_sprite:  2.5D RTS/RPG sprite sheet — transparent BG,
+    #                  N directions at isometric pitch, output as
+    #                  sprite sheet PNG + individual frame PNGs
+    #
+    # Pipeline: postprocess_parallel (prepare → xatlas → bake)
+    # Safety: tensor cloning, face-count render guard, CUDA health checks
+    # ============================================================
+
     import os, sys, pathlib, subprocess, re, time, threading, traceback, json, uuid, collections, shutil, gc, math
 
     os.environ["TRELLIS2_DISABLE_REMBG"] = "1"
@@ -45,13 +62,16 @@ def run_gui():
         def __init__(self, original, buf):
             self._original = original
             self._buf = buf
+
         def write(self, s):
             self._original.write(s)
             if s.strip():
                 self._buf.append(s.rstrip('\n'))
             return len(s)
+
         def flush(self):
             self._original.flush()
+
         def __getattr__(self, name):
             return getattr(self._original, name)
 
@@ -62,7 +82,7 @@ def run_gui():
     # ── Weight caching ──
     DRIVE_WEIGHTS = pathlib.Path("/content/drive/MyDrive/trellis2_weights_local")
     LOCAL_WEIGHTS = pathlib.Path("/content/trellis2_weights_local")
-    HF_MODEL_ID  = "microsoft/TRELLIS.2-4B"
+    HF_MODEL_ID = "microsoft/TRELLIS.2-4B"
 
     def dir_size_bytes(p):
         total = 0
@@ -71,15 +91,19 @@ def run_gui():
         return total
 
     def copy_weights(src, dst, label=""):
-        src = pathlib.Path(src); dst = pathlib.Path(dst)
+        src = pathlib.Path(src);
+        dst = pathlib.Path(dst)
         if dst.exists(): shutil.rmtree(dst)
-        total = dir_size_bytes(src); copied = 0
+        total = dir_size_bytes(src);
+        copied = 0
         file_count = sum(1 for f in src.rglob("*") if f.is_file())
         print(f"  Copying {file_count} files ({total / 1e9:.1f} GB) {label}...")
         dst.mkdir(parents=True, exist_ok=True)
         for item in src.rglob("*"):
-            rel = item.relative_to(src); target = dst / rel
-            if item.is_dir(): target.mkdir(parents=True, exist_ok=True)
+            rel = item.relative_to(src);
+            target = dst / rel
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(item), str(target))
@@ -87,17 +111,22 @@ def run_gui():
                 pct = int(copied / total * 100) if total else 100
                 sys.__stdout__.write(f"\r  {pct}% ({copied / 1e9:.1f} / {total / 1e9:.1f} GB)   ")
                 sys.__stdout__.flush()
-        sys.__stdout__.write("\n"); sys.__stdout__.flush()
+        sys.__stdout__.write("\n");
+        sys.__stdout__.flush()
         print(f"  ✅ Copy complete.")
 
     def resolve_weights():
         if LOCAL_WEIGHTS.exists() and any(LOCAL_WEIGHTS.iterdir()):
-            print(f"✅ Local weights found at {LOCAL_WEIGHTS}"); return str(LOCAL_WEIGHTS)
+            print(f"✅ Local weights found at {LOCAL_WEIGHTS}");
+            return str(LOCAL_WEIGHTS)
         if DRIVE_WEIGHTS.exists() and any(DRIVE_WEIGHTS.iterdir()):
             print(f"📂 Found cached weights on Drive: {DRIVE_WEIGHTS}")
-            try: copy_weights(DRIVE_WEIGHTS, LOCAL_WEIGHTS, label="Drive → local"); return str(LOCAL_WEIGHTS)
-            except Exception as e: print(f"  ⚠ Copy failed ({e}), downloading from HuggingFace.")
-        print(f"⬇ Downloading weights from {HF_MODEL_ID}..."); return HF_MODEL_ID
+            try:
+                copy_weights(DRIVE_WEIGHTS, LOCAL_WEIGHTS, label="Drive → local"); return str(LOCAL_WEIGHTS)
+            except Exception as e:
+                print(f"  ⚠ Copy failed ({e}), downloading from HuggingFace.")
+        print(f"⬇ Downloading weights from {HF_MODEL_ID}...");
+        return HF_MODEL_ID
 
     def cache_weights_to_drive():
         if DRIVE_WEIGHTS.exists() and any(DRIVE_WEIGHTS.iterdir()): return
@@ -106,20 +135,26 @@ def run_gui():
             try:
                 from huggingface_hub import snapshot_download
                 src = pathlib.Path(snapshot_download(HF_MODEL_ID, local_files_only=True))
-            except: print("  ⚠ Cannot find weights to cache."); return
+            except:
+                print("  ⚠ Cannot find weights to cache."); return
         weight_size = dir_size_bytes(src)
         print(f"\n💾 Saving weights to Drive ({weight_size / 1e9:.1f} GB)...")
         try:
             usage = shutil.disk_usage("/content/drive/MyDrive")
             if usage.free / 1e9 < weight_size / 1e9 + 1.0:
-                print(f"   ⚠ Not enough Drive space. Skipping."); return
-        except: pass
-        try: copy_weights(src, DRIVE_WEIGHTS, label="local → Drive")
+                print(f"   ⚠ Not enough Drive space. Skipping.");
+                return
+        except:
+            pass
+        try:
+            copy_weights(src, DRIVE_WEIGHTS, label="local → Drive")
         except Exception as e:
             print(f"   ⚠ Failed: {e}")
             if DRIVE_WEIGHTS.exists():
-                try: shutil.rmtree(DRIVE_WEIGHTS)
-                except: pass
+                try:
+                    shutil.rmtree(DRIVE_WEIGHTS)
+                except:
+                    pass
 
     # ── Pipeline ──
     REPO_DIR = pathlib.Path("/content/TRELLIS.2")
@@ -128,10 +163,14 @@ def run_gui():
     from PIL import Image
     import cv2, imageio
 
-    try: torch.backends.cuda.matmul.fp32_precision = "tf32"
-    except: pass
-    try: torch.backends.cudnn.conv.fp32_precision = "tf32"
-    except: pass
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+    except:
+        pass
+    try:
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+    except:
+        pass
     torch.set_float32_matmul_precision("high")
 
     if str(REPO_DIR) not in sys.path:
@@ -166,7 +205,8 @@ def run_gui():
             if not LOCAL_WEIGHTS.exists():
                 print(f"\n📁 Copying HF cache to {LOCAL_WEIGHTS}...")
                 copy_weights(hf_cache_path, LOCAL_WEIGHTS, label="HF cache → local")
-        except Exception as e: print(f"  ⚠ Could not copy HF cache: {e}")
+        except Exception as e:
+            print(f"  ⚠ Could not copy HF cache: {e}")
         threading.Thread(target=cache_weights_to_drive, daemon=True).start()
 
     hdri = REPO_DIR / "assets" / "hdri" / "forest.exr"
@@ -186,8 +226,10 @@ def run_gui():
 
     def safe_cleanup():
         gc.collect()
-        try: torch.cuda.empty_cache()
-        except: pass
+        try:
+            torch.cuda.empty_cache()
+        except:
+            pass
         gc.collect()
 
     def safe_offload_models():
@@ -206,7 +248,7 @@ def run_gui():
             try:
                 attr = getattr(trellis_pipe, attr_name)
                 if isinstance(attr, torch.nn.Module) and any(
-                    p.is_cuda for p in attr.parameters()
+                        p.is_cuda for p in attr.parameters()
                 ):
                     attr.to("cpu")
             except:
@@ -222,31 +264,40 @@ def run_gui():
     # ── RMBG lazy ──
     rmbg_pipe = None
     rmbg_lock = threading.Lock()
+
     def get_rmbg():
         global rmbg_pipe
         if rmbg_pipe is None:
             from transformers import pipeline as hf_pipeline
             if not hasattr(torch.nn.Module, "_patched_all_tied_weights_keys"):
                 torch.nn.Module._patched_all_tied_weights_keys = True
+
                 @property
                 def _atwk(self): return {}
+
                 setattr(torch.nn.Module, "all_tied_weights_keys", _atwk)
             rmbg_pipe = hf_pipeline("image-segmentation", model="briaai/RMBG-1.4", trust_remote_code=True)
         return rmbg_pipe
 
     # ── State ──
-    UPLOAD_DIR = pathlib.Path("/content/_trellis_uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
-    jobs = {}; active_jobs = {}; _gpu_lock = threading.Lock()
+    UPLOAD_DIR = pathlib.Path("/content/_trellis_uploads");
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    jobs = {};
+    active_jobs = {};
+    _gpu_lock = threading.Lock()
 
     def safe_stem(name):
-        s = pathlib.Path(name).stem.strip(); s = re.sub(r"\s+","_",s); s = re.sub(r"[^A-Za-z0-9._-]+","",s)
+        s = pathlib.Path(name).stem.strip();
+        s = re.sub(r"\s+", "_", s);
+        s = re.sub(r"[^A-Za-z0-9._-]+", "", s)
         return s or "image"
 
     def fmt_bytes(n):
-        units=["B","KB","MB","GB","TB"]; f=float(max(n,0)); i=0
-        while f>=1024.0 and i<len(units)-1: f/=1024.0; i+=1
-        return f"{int(f)} {units[i]}" if i==0 else f"{f:.2f} {units[i]}"
-
+        units = ["B", "KB", "MB", "GB", "TB"];
+        f = float(max(n, 0));
+        i = 0
+        while f >= 1024.0 and i < len(units) - 1: f /= 1024.0; i += 1
+        return f"{int(f)} {units[i]}" if i == 0 else f"{f:.2f} {units[i]}"
 
     # ══════════════════════════════════════════════════════════════
     # RENDERING HELPERS
@@ -378,7 +429,6 @@ def run_gui():
                 raise RuntimeError("CUDA context corrupted after render failure")
             return None, None
 
-
     def _build_rts_spritesheet(all_frames, out_path, base, n_dirs, frame_size):
         """
         Composite rendered frames into an RTS-compatible sprite sheet.
@@ -488,7 +538,6 @@ def run_gui():
         del pil_frames, all_frames
         return str(sheet_path), "rts_sprite"
 
-
     def _build_doom_spritesheet(all_frames, out_path, base, n_dirs, frame_size):
         """
         Build Doom/Build-engine style billboard sprite sheet.
@@ -556,9 +605,9 @@ def run_gui():
 
             # Doom-style naming
             if n_dirs <= 8:
-                lbl = f"A{i+1}"
+                lbl = f"A{i + 1}"
             else:
-                lbl = f"A{i+1:02d}"
+                lbl = f"A{i + 1:02d}"
 
             frame_path = sprite_dir / f"{base}_{lbl}.png"
             rgba.save(str(frame_path), "PNG")
@@ -582,27 +631,31 @@ def run_gui():
         del pil_frames, all_frames
         return str(sheet_path), "doom_sprite"
 
-
     # ══════════════════════════════════════════════════════════════
     # GENERATION JOB — fully sequential per image
     # ══════════════════════════════════════════════════════════════
 
     STEPS = [
-        ("Loading image...",       0.01),
+        ("Loading image...", 0.01),
         ("Running 3D reconstruction...", 0.30),
-        ("Preparing mesh...",      0.10),
+        ("Preparing mesh...", 0.10),
         ("UV unwrapping (xatlas)...", 0.20),
         ("Baking textures + GLB...", 0.24),
-        ("Rendering preview...",   0.15),
+        ("Rendering preview...", 0.15),
     ]
 
     MAX_RETRIES = 3
 
     def run_generate_job(job_id):
-        job = jobs[job_id]; active_jobs["generate"] = job_id
-        s = job["settings"]; files = job["files"]
-        out_path = pathlib.Path(s["output_dir"]); out_path.mkdir(parents=True, exist_ok=True)
-        total = len(files); done = 0; t0_all = time.perf_counter()
+        job = jobs[job_id];
+        active_jobs["generate"] = job_id
+        s = job["settings"];
+        files = job["files"]
+        out_path = pathlib.Path(s["output_dir"]);
+        out_path.mkdir(parents=True, exist_ok=True)
+        total = len(files);
+        done = 0;
+        t0_all = time.perf_counter()
 
         with _gpu_lock:
             for idx, (orig_name, file_path) in enumerate(files):
@@ -621,7 +674,7 @@ def run_gui():
                     }
 
                 set_phase(0)
-                job["log"].append(f"[{idx+1}/{total}] Processing: {orig_name}")
+                job["log"].append(f"[{idx + 1}/{total}] Processing: {orig_name}")
                 t0 = time.perf_counter()
 
                 error = None
@@ -635,10 +688,11 @@ def run_gui():
                         image = Image.open(file_path).convert("RGBA")
 
                         if attempt > 0:
-                            job["log"].append(f"  🔄 Retry {attempt+1}/{MAX_RETRIES}...")
+                            job["log"].append(f"  🔄 Retry {attempt + 1}/{MAX_RETRIES}...")
                             try:
                                 torch.cuda.reset_peak_memory_stats()
-                            except: pass
+                            except:
+                                pass
                             safe_reload_models()
 
                         set_phase(1)
@@ -666,13 +720,27 @@ def run_gui():
                             f"{mesh.vertices.shape[0]:,} verts, {mesh.faces.shape[0]:,} faces"
                         )
 
-                        # ── Simplify for nvdiffrec render limit ──
+                        # ── Simplify mesh to decimate target BEFORE rendering ──
+                        # This ensures the render shows the same mesh that ships
+                        # in the GLB, and keeps face counts in a safe range for
+                        # the nvdiffrec renderer (which corrupts CUDA above ~16M).
+                        decimate_target = s["decimate_target"]
+                        render_limit = min(decimate_target, RENDER_MAX_FACES)
                         n_raw = mesh.faces.shape[0]
-                        if n_raw > 16777216:
-                            job["log"].append(f"  ▸ Simplifying for render: {n_raw:,} → 16,777,216 faces")
-                            mesh.simplify(16777216)
+                        if n_raw > render_limit:
+                            job["log"].append(
+                                f"  ▸ Simplifying: {n_raw:,} → {render_limit:,} faces"
+                            )
+                            mesh.simplify(render_limit)
+                            # Re-clone after in-place simplify
+                            mesh.vertices = mesh.vertices.clone()
+                            mesh.faces = mesh.faces.clone()
+                            job["log"].append(
+                                f"  ✓ Simplified: {mesh.vertices.shape[0]:,} verts, "
+                                f"{mesh.faces.shape[0]:,} faces"
+                            )
 
-                        # ── Render preview (BEFORE offload) ──
+                        # ── Render preview (on simplified mesh, BEFORE offload) ──
                         set_phase(5)
                         render_mode = s.get("render_mode", "video")
                         media_path, media_type = None, None
@@ -770,22 +838,34 @@ def run_gui():
                                      or "illegal memory" in err or "cuda error" in err
                                      or "accelerator" in err)
                         if attempt < MAX_RETRIES - 1 and retryable:
-                            job["log"].append(f"  ⚠ Attempt {attempt+1} failed: {e}")
-                            try: del out
-                            except: pass
-                            try: del mesh
-                            except: pass
-                            try: del prepared
-                            except: pass
-                            try: del unwrapped
-                            except: pass
+                            job["log"].append(f"  ⚠ Attempt {attempt + 1} failed: {e}")
+                            try:
+                                del out
+                            except:
+                                pass
+                            try:
+                                del mesh
+                            except:
+                                pass
+                            try:
+                                del prepared
+                            except:
+                                pass
+                            try:
+                                del unwrapped
+                            except:
+                                pass
                             safe_offload_models()
                             gc.collect()
-                            try: torch.cuda.synchronize()
-                            except: pass
+                            try:
+                                torch.cuda.synchronize()
+                            except:
+                                pass
                             gc.collect()
-                            try: torch.cuda.empty_cache()
-                            except: pass
+                            try:
+                                torch.cuda.empty_cache()
+                            except:
+                                pass
                             free = TOTAL_VRAM - torch.cuda.memory_allocated() / 1e9
                             job["log"].append(f"    Cleanup done | {free:.1f}GB free")
                             time.sleep(3)
@@ -811,10 +891,13 @@ def run_gui():
                 "elapsed": round(dt_total, 1),
             }
 
-
     def run_rmbg_job(job_id):
-        job = jobs[job_id]; active_jobs["rmbg"] = job_id; files = job["files"]
-        total = len(files); done = 0; t0 = time.perf_counter()
+        job = jobs[job_id];
+        active_jobs["rmbg"] = job_id;
+        files = job["files"]
+        total = len(files);
+        done = 0;
+        t0 = time.perf_counter()
         with rmbg_lock:
             job["progress"] = {"pct": 0, "image_num": 0, "total": total,
                                "name": "Loading model...", "phase": "Loading RMBG-1.4...", "elapsed": 0}
@@ -824,13 +907,14 @@ def run_gui():
             for idx, (orig_name, file_path) in enumerate(files):
                 base = safe_stem(orig_name)
                 out_p = pathlib.Path(file_path).parent / f"{base}_transparent.png"
-                job["progress"] = {"pct": round((idx/total)*100, 1), "image_num": idx+1,
+                job["progress"] = {"pct": round((idx / total) * 100, 1), "image_num": idx + 1,
                                    "total": total, "name": orig_name,
                                    "phase": "Removing background...",
-                                   "elapsed": round(time.perf_counter()-t0, 1)}
-                job["log"].append(f"[{idx+1}/{total}] {orig_name}")
+                                   "elapsed": round(time.perf_counter() - t0, 1)}
+                job["log"].append(f"[{idx + 1}/{total}] {orig_name}")
                 try:
-                    rgba = rmbg(str(file_path)); rgba.save(str(out_p), "PNG")
+                    rgba = rmbg(str(file_path));
+                    rgba.save(str(out_p), "PNG")
                     job["log"].append(f"  ✅ {base}_transparent.png")
                     job["results"].append({"name": base, "file": str(out_p), "original": orig_name})
                     done += 1
@@ -844,7 +928,6 @@ def run_gui():
                                "name": "Complete", "phase": "All done!",
                                "elapsed": round(dt, 1)}
 
-
     # ══════════════════════════════════════════════════════════════
     # FLASK
     # ══════════════════════════════════════════════════════════════
@@ -856,7 +939,6 @@ def run_gui():
     @app.route("/api/keepalive")
     def api_keepalive():
         return jsonify({"ok": True})
-
 
     # ── HTML PAGE ──
 
@@ -922,7 +1004,7 @@ def run_gui():
       <div class="header"><img src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/assets/logo.png" alt="MissingLink"><div class="header-text"><h1>2D to 3D <span>Generator</span></h1><p>Powered by TRELLIS.2 &amp; MissingLink</p></div></div>
       <div class="banner"><strong>MissingLink</strong> provides <span class="hl">ultra-fast, optimized 3D generation</span> on A100, L4, and T4 GPUs. Heavily optimized precompiled wheels eliminate 30+ minute build times — just pip install and run. Easy-to-use Colab notebooks get you generating in under 60 seconds.</div>
       <div class="tabs"><button class="tab-btn active" data-tab="generate" onclick="switchTab('generate',this)">🔺 Generate 3D</button><button class="tab-btn" data-tab="rmbg" onclick="switchTab('rmbg',this)">✂ Remove Background</button></div>
-    
+
       <!-- ── GENERATE TAB ── -->
       <div class="tab-panel active" id="tab-generate">
         <div class="instructions"><strong>Upload your images and generate 3D models.</strong><br>Each image becomes a downloadable GLB model with optional preview render, saved to Google Drive.<br><br><span class="warn">⚠ Images must have transparent backgrounds (PNG with alpha).</span> Use the <strong>Remove Background</strong> tab first if needed.</div>
@@ -931,7 +1013,7 @@ def run_gui():
         <button class="settings-toggle" onclick="this.classList.toggle('open');document.getElementById('settingsPanel').classList.toggle('open')">⚙ Generation settings <span class="arrow">▾</span></button>
         <div class="settings-panel" id="settingsPanel">
           <div class="field"><label>Output directory</label><input type="text" id="sOutDir" value="/content/drive/MyDrive/trellis_models_out"><div class="hint">Google Drive path for GLB + preview output</div></div>
-    
+
           <div class="field">
             <label>Render mode</label>
             <div class="render-modes" id="renderModes">
@@ -967,7 +1049,7 @@ def run_gui():
               </div>
             </div>
           </div>
-    
+
           <!-- RTS Sprite-specific settings (conditionally shown) -->
           <div class="rts-settings" id="rtsSettings">
             <div class="rts-title">🎮 RTS / RPG Sprite Settings</div>
@@ -1005,7 +1087,7 @@ def run_gui():
               <div class="hint">Camera angle above horizon — controls the 2.5D look</div>
             </div>
           </div>
-    
+
           <!-- Doom Sprite-specific settings (conditionally shown) -->
           <div class="doom-settings" id="doomSettings">
             <div class="doom-title">👹 Doom / FPS Billboard Sprite Settings</div>
@@ -1041,7 +1123,7 @@ def run_gui():
               <div class="hint">Doom = dead-on eye level; Build engine = slight down-angle</div>
             </div>
           </div>
-    
+
           <div class="field-row"><div class="field"><label>Video FPS</label><input type="number" id="sFps" value="15" min="5" max="60"></div><div class="field"><label>Texture size</label><select id="sTexture"><option>1024</option><option>2048</option><option selected>4096</option><option>8192</option></select></div></div>
           <div class="field-row"><div class="field"><label>Max faces</label><input type="number" id="sDecimate" value="1000000" min="1000"><div class="hint">Target face count for exported GLB</div></div><div class="field"><label>Remesh band</label><input type="number" id="sRemeshBand" value="1.0" min="0.1" max="3.0" step="0.1"></div></div>
           <label class="checkbox-row"><input type="checkbox" id="sRemesh" checked> Enable remeshing</label>
@@ -1051,7 +1133,7 @@ def run_gui():
         <div class="log-box" id="logBox3d"></div>
         <div class="results" id="results3d"><div class="results-header">✅ Results</div><div id="resultsList3d"></div></div>
       </div>
-    
+
       <!-- ── RMBG TAB ── -->
       <div class="tab-panel" id="tab-rmbg">
         <div class="instructions"><strong>Remove backgrounds from your images before 3D generation.</strong><br>Upload images with backgrounds — processed through RMBG-1.4 into transparent PNGs. Model loads on first use.</div>
@@ -1068,7 +1150,7 @@ def run_gui():
     function $(id){return document.getElementById(id)}function enc(s){return encodeURIComponent(s)}function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}function show(id){$(id).classList.add('active')}function hide(id){$(id).classList.remove('active')}function fmtTime(s){const m=Math.floor(s/60),sec=Math.floor(s%60);return m+':'+String(sec).padStart(2,'0')}
     function switchTab(name,el){document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));el.classList.add('active');$('tab-'+name).classList.add('active')}
     function toggleConsole(){$('consoleHead3d').classList.toggle('open');$('consoleBody3d').classList.toggle('open')}
-    
+
     /* ── Render mode selector ── */
     let selectedRenderMode='video';
     function selectRender(el){
@@ -1083,23 +1165,23 @@ def run_gui():
       if(selectedRenderMode==='rts_sprite'){rts.classList.add('visible')}
       else if(selectedRenderMode==='doom_sprite'){doom.classList.add('visible')}
     }
-    
+
     /* ── Dropzone ── */
     function initDrop(zId,iId,tId,bId,arr){const z=$(zId),inp=$(iId);['dragenter','dragover'].forEach(e=>z.addEventListener(e,ev=>{ev.preventDefault();z.classList.add('over')}));['dragleave','drop'].forEach(e=>z.addEventListener(e,ev=>{ev.preventDefault();z.classList.remove('over')}));z.addEventListener('drop',ev=>addF(ev.dataTransfer.files,arr,tId,bId));inp.addEventListener('change',ev=>{addF(ev.target.files,arr,tId,bId);inp.value=''})}
     function addF(fl,arr,tId,bId){for(const f of fl)if(f.type.startsWith('image/'))arr.push(f);renderT(arr,tId,bId)}
     function renderT(arr,tId,bId){const t=$(tId);t.innerHTML='';arr.forEach((f,i)=>{const d=document.createElement('div');d.className='thumb';const img=document.createElement('img');img.src=URL.createObjectURL(f);const x=document.createElement('button');x.className='thumb-x';x.textContent='×';x.onclick=()=>{arr.splice(i,1);renderT(arr,tId,bId)};d.append(img,x);t.append(d)});$(bId).disabled=arr.length===0}
     let files3d=[],filesRmbg=[];initDrop('dropzone3d','fileInput3d','thumbs3d','genBtn3d',files3d);initDrop('dropzoneRmbg','fileInputRmbg','thumbsRmbg','genBtnRmbg',filesRmbg);
-    
+
     /* ── Keepalive ── */
     setInterval(async()=>{try{const r=await fetch('/api/keepalive');$('keepaliveBadge').style.color=r.ok?'var(--green)':'var(--red)'}catch(e){$('keepaliveBadge').style.color='var(--red)'}setTimeout(()=>{$('keepaliveBadge').style.color='var(--gray)'},2000)},60000);
-    
+
     /* ── Polling ── */
     let timers={},localStart={};
     function poll(jobId,type,cfg){if(timers[type])clearInterval(timers[type]);if(!localStart[type])localStart[type]=Date.now();timers[type]=setInterval(async()=>{try{const r=await fetch('/api/status/'+jobId);const d=await r.json();const p=d.progress||{};const elapsed=p.elapsed||((Date.now()-localStart[type])/1000);$(cfg.timer).textContent=fmtTime(elapsed);const pct=p.pct||0;$(cfg.fill).style.width=pct+'%';$(cfg.pct).textContent=Math.round(pct)+'%';$(cfg.phase).textContent=p.phase||'';if(cfg.image&&p.image_num&&p.total)$(cfg.image).textContent='Image '+p.image_num+' of '+p.total+(p.name?' — '+p.name:'');if(d.status==='done')$(cfg.status).innerHTML='<span class="done-icon">✅</span> Complete';else $(cfg.status).innerHTML='<span class="spinner"></span> '+cfg.statusText;if(d.log){const b=$(cfg.log);b.textContent=d.log.join('\n');b.scrollTop=b.scrollHeight}if(cfg.console){const cr=await fetch('/api/console');const cd=await cr.json();const cel=$(cfg.console);cel.textContent=cd.lines.join('\n');cel.scrollTop=cel.scrollHeight}if(d.status==='done'){clearInterval(timers[type]);timers[type]=null;delete localStart[type];if(cfg.btn){cfg.btn.disabled=false;cfg.btn.textContent=cfg.btnText}cfg.renderFn(d.results||[])}}catch(e){console.error(e)}},800)}
-    
+
     /* ── Generate ── */
     async function startGen(){if(!files3d.length)return;const btn=$('genBtn3d');btn.disabled=true;btn.textContent='Uploading images...';const fd=new FormData();files3d.forEach(f=>fd.append('images',f));fd.append('settings',JSON.stringify({output_dir:$('sOutDir').value,fps:parseInt($('sFps').value),texture_size:parseInt($('sTexture').value),decimate_target:parseInt($('sDecimate').value),remesh:$('sRemesh').checked,remesh_band:parseFloat($('sRemeshBand').value),render_mode:selectedRenderMode,video_resolution:512,sprite_directions:parseInt($('sSpriteDirections').value),sprite_size:parseInt($('sSpriteSize').value),sprite_pitch:parseFloat($('sSpritePitch').value),doom_directions:parseInt($('sDoomDirections').value),doom_size:parseInt($('sDoomSize').value),doom_pitch:parseFloat($('sDoomPitch').value)}));try{const r=await fetch('/api/generate',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Generating...';show('progressPanel3d');show('logBox3d');$('logBox3d').textContent='';hide('results3d');$('resultsList3d').innerHTML='';$('pFill3d').style.width='0%';$('pPct3d').textContent='0%';localStart['generate']=Date.now();poll(d.job_id,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:btn,btnText:'Generate 3D models →',renderFn:render3d})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate 3D models →'}}
-    
+
     /* ── Render results — handles all media types including RTS and Doom sprites ── */
     function render3d(results){if(!results.length)return;show('results3d');const l=$('resultsList3d');l.innerHTML='';results.forEach(r=>{const c=document.createElement('div');c.className='result-card';let mediaHtml='';
     if((r.media_type==='rts_sprite'||r.media_type==='doom_sprite')&&r.media){
@@ -1137,11 +1219,11 @@ def run_gui():
       c.appendChild(gal);
     }
     l.append(c)})}
-    
+
     /* ── RMBG ── */
     async function startRmbg(){if(!filesRmbg.length)return;const btn=$('genBtnRmbg');btn.disabled=true;btn.textContent='Uploading...';const fd=new FormData();filesRmbg.forEach(f=>fd.append('images',f));try{const r=await fetch('/api/rmbg',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Processing...';show('progressPanelRmbg');show('logBoxRmbg');$('logBoxRmbg').textContent='';hide('resultsRmbg');$('resultsListRmbg').innerHTML='';$('pFillRmbg').style.width='0%';$('pPctRmbg').textContent='0%';localStart['rmbg']=Date.now();poll(d.job_id,'rmbg',{timer:'pTimerRmbg',fill:'pFillRmbg',pct:'pPctRmbg',phase:'pPhaseRmbg',status:'pStatusRmbg',statusText:'Processing...',image:null,log:'logBoxRmbg',console:null,btn:btn,btnText:'Remove backgrounds →',renderFn:renderRmbg})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Remove backgrounds →'}}
     function renderRmbg(results){if(!results.length)return;show('resultsRmbg');const l=$('resultsListRmbg');l.innerHTML='';results.forEach(r=>{const c=document.createElement('div');c.className='result-card';c.innerHTML=`<img class="result-img" src="/api/file?p=${enc(r.file)}" alt="${esc(r.name)}"><div class="result-info"><div class="result-name">${esc(r.name)}_transparent.png</div><div class="result-actions"><a class="dl-btn" href="/api/file?p=${enc(r.file)}" download="${esc(r.name)}_transparent.png">Download PNG</a></div></div>`;l.append(c)})}
-    
+
     /* ── Reconnect ── */
     async function tryReconnect(){try{const r=await fetch('/api/active');const d=await r.json();if(d.generate){show('progressPanel3d');show('logBox3d');$('genBtn3d').disabled=true;$('genBtn3d').textContent='Generating...';localStart['generate']=Date.now();poll(d.generate,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:$('genBtn3d'),btnText:'Generate 3D models →',renderFn:render3d})}if(d.rmbg){switchTab('rmbg',document.querySelector('[data-tab=rmbg]'));show('progressPanelRmbg');show('logBoxRmbg');$('genBtnRmbg').disabled=true;$('genBtnRmbg').textContent='Processing...';localStart['rmbg']=Date.now();poll(d.rmbg,'rmbg',{timer:'pTimerRmbg',fill:'pFillRmbg',pct:'pPctRmbg',phase:'pPhaseRmbg',status:'pStatusRmbg',statusText:'Processing...',image:null,log:'logBoxRmbg',console:null,btn:$('genBtnRmbg'),btnText:'Remove backgrounds →',renderFn:renderRmbg})}}catch(e){}}
     tryReconnect();
@@ -1182,11 +1264,13 @@ def run_gui():
         settings["output_dir"] = real_out  # store resolved path
 
         job_id = uuid.uuid4().hex[:12]
-        job_dir = UPLOAD_DIR / job_id; job_dir.mkdir(parents=True, exist_ok=True)
+        job_dir = UPLOAD_DIR / job_id;
+        job_dir.mkdir(parents=True, exist_ok=True)
         saved = []
         for f in files:
             safe_name = secure_filename(f.filename) or f"upload_{uuid.uuid4().hex[:8]}.png"
-            dest = job_dir / safe_name; f.save(str(dest))
+            dest = job_dir / safe_name;
+            f.save(str(dest))
             saved.append((f.filename, str(dest)))
         jobs[job_id] = {
             "status": "running",
@@ -1203,11 +1287,13 @@ def run_gui():
         if not files:
             return jsonify({"error": "No images"}), 400
         job_id = uuid.uuid4().hex[:12]
-        job_dir = UPLOAD_DIR / job_id; job_dir.mkdir(parents=True, exist_ok=True)
+        job_dir = UPLOAD_DIR / job_id;
+        job_dir.mkdir(parents=True, exist_ok=True)
         saved = []
         for f in files:
             safe_name = secure_filename(f.filename) or f"upload_{uuid.uuid4().hex[:8]}.png"
-            dest = job_dir / safe_name; f.save(str(dest))
+            dest = job_dir / safe_name;
+            f.save(str(dest))
             saved.append((f.filename, str(dest)))
         jobs[job_id] = {
             "status": "running",
@@ -1284,7 +1370,6 @@ def run_gui():
 
         return send_file(real)
 
-
     # ══════════════════════════════════════════════════════════════
     # LAUNCH
     # ══════════════════════════════════════════════════════════════
@@ -1341,7 +1426,8 @@ def run_gui():
     try:
         while True:
             time.sleep(30)
-            sys.__stdout__.write(f"\r🔺 Uptime: {time.strftime('%H:%M:%S', time.gmtime(time.time()))} | Jobs: {len(jobs)}   ")
+            sys.__stdout__.write(
+                f"\r🔺 Uptime: {time.strftime('%H:%M:%S', time.gmtime(time.time()))} | Jobs: {len(jobs)}   ")
             sys.__stdout__.flush()
     except KeyboardInterrupt:
         print("\n\n🛑 Server stopped.")
