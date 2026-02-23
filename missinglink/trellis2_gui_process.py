@@ -1371,7 +1371,16 @@ def run_gui():
         return send_file(real)
 
     # ══════════════════════════════════════════════════════════════
-    # LAUNCH  (robust — health-checked, proxy-verified, must-not-fail)
+    # LAUNCH  (robust — health-checked, 3-tier fallback, must-not-fail)
+    #
+    #   Tier 1: Verified proxyPort URL → new-tab link
+    #   Tier 2: serve_kernel_port_as_iframe → UI embedded in cell
+    #   Tier 3: serve_kernel_port_as_window → clickable Colab link
+    #
+    # The server is NEVER advertised until a local health-check passes.
+    # A link is NEVER shown unless end-to-end connectivity is confirmed
+    # (or we fall back to Colab's own iframe/window helpers which
+    # handle the proxy internally and are as reliable as Colab itself).
     # ══════════════════════════════════════════════════════════════
     import socket as _socket
     import requests as _requests
@@ -1402,7 +1411,7 @@ def run_gui():
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
 
-    # ── 1) Wait until Flask is actually responding on localhost ──
+    # ── 1) Wait until Flask is actually responding on localhost ──────
     _local_ready = False
     _last_local_err = None
     for _attempt in range(80):          # ~40 s total
@@ -1428,13 +1437,16 @@ def run_gui():
 
     sys.__stdout__.write(f"✅ Flask server healthy on localhost:{PORT}\n")
 
-    # ── 2) Obtain & verify public URL ──
+    # ── 2) Obtain & verify public access (Colab only) ──────────────
+    _launch_mode = None   # will be: "proxy_url" | "iframe" | "window" | "local"
     public_url = None
 
     if IN_COLAB:
+        from IPython.display import display, HTML as _HTML
+
+        # ── Tier 1: proxyPort URL with end-to-end verification ──
         _last_proxy_err = None
-        for _proxy_attempt in range(30):   # ~15 s
-            # 2a) Ask Colab for the proxy URL
+        for _proxy_attempt in range(20):   # ~10 s  (fast — we fall back if this doesn't work)
             try:
                 _candidate = eval_js(
                     f"google.colab.kernel.proxyPort({PORT}, {{'cache': false}})"
@@ -1446,41 +1458,98 @@ def run_gui():
                 _candidate = None
 
             if _candidate:
-                # 2b) Verify the proxy actually routes to our server
+                # Verify the proxy actually routes to our server
                 try:
                     _rr = _requests.get(
                         _candidate.rstrip("/") + "/api/keepalive", timeout=4
                     )
                     if _rr.status_code == 200:
                         public_url = _candidate
+                        _launch_mode = "proxy_url"
                         break
                 except Exception:
                     pass          # proxy not ready yet — retry
 
             time.sleep(0.5)
 
-        if not public_url:
-            raise RuntimeError(
-                f"Could not obtain a working Colab proxy URL for port {PORT}.\n"
-                f"  Last proxyPort error: {_last_proxy_err}\n"
-                f"  The Flask server IS running locally — the problem is the proxy tunnel.\n"
-                f"  Try: Runtime → Disconnect and delete runtime, then reconnect."
-            )
-
-        # ── Display verified link ──
-        from IPython.display import display, HTML as _HTML
-        display(_HTML(f"""
-        <div style="margin:16px 0;padding:16px 24px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
-            <div style="color:#8A8A8A;font-size:13px;margin-bottom:8px;">🔺 TRELLIS.2 Generator is live — click to open:</div>
-            <a href="{public_url}" target="_blank" style="color:#E8A917;font-size:18px;font-weight:bold;text-decoration:underline;">{public_url}</a>
-            <div style="color:#8A8A8A;font-size:12px;margin-top:10px;">
-                Health check:
-                <a href="{public_url.rstrip('/')}/api/keepalive" target="_blank"
-                   style="color:#8A8A8A;text-decoration:underline;">/api/keepalive</a>
+        if _launch_mode == "proxy_url":
+            # Show verified clickable link
+            display(_HTML(f"""
+            <div style="margin:16px 0;padding:16px 24px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
+                <div style="color:#8A8A8A;font-size:13px;margin-bottom:8px;">🔺 TRELLIS.2 Generator is live — click to open:</div>
+                <a href="{public_url}" target="_blank" style="color:#E8A917;font-size:18px;font-weight:bold;text-decoration:underline;">{public_url}</a>
+                <div style="color:#8A8A8A;font-size:12px;margin-top:10px;">
+                    Health check:
+                    <a href="{public_url.rstrip('/')}/api/keepalive" target="_blank"
+                       style="color:#8A8A8A;text-decoration:underline;">/api/keepalive</a>
+                </div>
             </div>
-        </div>
-        """))
+            """))
+        else:
+            # ── Tier 2: Embed as iframe inside the notebook cell ──
+            sys.__stdout__.write(
+                f"⚠ Proxy URL not reachable (last error: {_last_proxy_err}).\n"
+                f"  Falling back to embedded iframe in notebook...\n"
+            )
+            _iframe_ok = False
+            try:
+                from google.colab import output as _colab_output
+                _colab_output.serve_kernel_port_as_iframe(PORT, height='820')
+                _launch_mode = "iframe"
+                _iframe_ok = True
+                display(_HTML("""
+                <div style="margin:8px 0 4px;padding:10px 16px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
+                    <span style="color:#E8A917;font-weight:bold;">🔺 TRELLIS.2 Generator</span>
+                    <span style="color:#8A8A8A;font-size:13px;"> — embedded above ↑  (scroll up if needed)</span>
+                </div>
+                """))
+            except Exception as _iframe_err:
+                sys.__stdout__.write(f"  ⚠ iframe fallback failed: {_iframe_err}\n")
+
+            # ── Tier 3: serve_kernel_port_as_window (clickable Colab link) ──
+            if not _iframe_ok:
+                try:
+                    from google.colab import output as _colab_output
+                    _colab_output.serve_kernel_port_as_window(PORT, anchor_text="🔺 Click to open TRELLIS.2 Generator")
+                    _launch_mode = "window"
+                    display(_HTML("""
+                    <div style="margin:8px 0;padding:10px 16px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
+                        <span style="color:#8A8A8A;font-size:13px;">Click the link above to open the UI in a new tab.</span>
+                    </div>
+                    """))
+                except Exception as _window_err:
+                    sys.__stdout__.write(f"  ⚠ window fallback also failed: {_window_err}\n")
+                    # ── Absolute last resort: raw JS iframe injection ──
+                    try:
+                        from IPython.display import Javascript as _JS
+                        display(_JS("""
+                        (async () => {
+                            const url = await google.colab.kernel.proxyPort(%d, {cache: false});
+                            const iframe = document.createElement('iframe');
+                            iframe.src = url;
+                            iframe.width = '100%%';
+                            iframe.height = '820';
+                            iframe.style.border = '2px solid #E8A917';
+                            iframe.style.borderRadius = '12px';
+                            document.querySelector('#output-area').appendChild(iframe);
+                        })();
+                        """ % PORT))
+                        _launch_mode = "js_iframe"
+                    except Exception as _js_err:
+                        raise RuntimeError(
+                            f"All Colab display methods failed for port {PORT}.\n"
+                            f"  proxyPort error  : {_last_proxy_err}\n"
+                            f"  iframe error     : {_iframe_err}\n"
+                            f"  window error     : {_window_err}\n"
+                            f"  JS iframe error  : {_js_err}\n"
+                            f"  The Flask server IS running on localhost:{PORT}.\n"
+                            f"  Try: Runtime → Disconnect and delete runtime, then reconnect."
+                        )
+
+        sys.__stdout__.write(f"🚀 Launch mode: {_launch_mode}\n")
+
     else:
+        _launch_mode = "local"
         print(f"\n🔺 TRELLIS.2 Generator running at http://localhost:{PORT}\n")
 
     print("Server running. Interrupt cell to stop.\n")
@@ -1493,7 +1562,7 @@ def run_gui():
             _h, _rem = divmod(_uptime, 3600)
             _m, _s = divmod(_rem, 60)
             sys.__stdout__.write(
-                f"\r🔺 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Jobs: {len(jobs)}   "
+                f"\r🔺 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Mode: {_launch_mode} | Jobs: {len(jobs)}   "
             )
             sys.__stdout__.flush()
     except KeyboardInterrupt:
