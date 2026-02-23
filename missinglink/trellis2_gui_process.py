@@ -342,6 +342,8 @@ def run_gui():
         from trellis2 import models as _models_mod
 
         is_local = _os.path.exists(f"{path}/{config_file}")
+        _path_is_local_dir = _os.path.isdir(path)
+
         if is_local:
             cfg_path = f"{path}/{config_file}"
         else:
@@ -358,17 +360,19 @@ def run_gui():
                 continue
 
             done = False
-            # Try local path first (our pre-downloaded files)
-            # models.from_pretrained expects a path where {path}.json and
-            # {path}.safetensors exist — NOT a directory
             local_path = f"{path}/{v}"
-            has_local_files = (
-                _os.path.exists(f"{local_path}.json")
-                and _os.path.exists(f"{local_path}.safetensors")
+            json_exists = _os.path.exists(f"{local_path}.json")
+            safetensors_exists = _os.path.exists(f"{local_path}.safetensors")
+            safetensors_valid = (
+                safetensors_exists
+                and _os.path.getsize(f"{local_path}.safetensors") > 1024
             )
-            if has_local_files:
+
+            # ── Try 1: load from local files ──
+            if json_exists and safetensors_valid:
                 try:
-                    sys.__stdout__.write(f"  [{i}/{total}] {k} (local)...")
+                    _sz = _os.path.getsize(f"{local_path}.safetensors") / 1e9
+                    sys.__stdout__.write(f"  [{i}/{total}] {k} (local, {_sz:.2f} GB)...")
                     sys.__stdout__.flush()
                     _loaded[k] = _models_mod.from_pretrained(local_path)
                     sys.__stdout__.write(" ✓\n")
@@ -376,22 +380,41 @@ def run_gui():
                 except Exception as e:
                     sys.__stdout__.write(f" ⚠ {e}\n")
 
-            # Fallback: try the full HF-style path (repo/subpath)
+            # ── Try 2: download just this model's files from HF ──
             if not done:
+                from huggingface_hub import hf_hub_download as _hf_dl
+                # Figure out the HF repo ID — either from env or from path
+                _repo_id = _os.environ.get("TRELLIS2_HF_REPO", HF_MODEL_ID)
+
+                sys.__stdout__.write(f"  [{i}/{total}] {k} (downloading {v}.json + .safetensors)...")
+                sys.__stdout__.flush()
                 try:
-                    # Use f"{path}/{v}" so models.__init__ gets the full
-                    # "microsoft/TRELLIS.2-4B/ckpts/model_name" string
-                    # which it can parse into repo_id + model_name
-                    full_hf_path = f"{path}/{v}" if "/" in path else v
-                    sys.__stdout__.write(f"  [{i}/{total}] {k} (HF: {full_hf_path})...")
-                    sys.__stdout__.flush()
-                    _loaded[k] = _models_mod.from_pretrained(full_hf_path)
+                    # Download config + weights for this one model
+                    _dl_json = _hf_dl(
+                        repo_id=_repo_id, filename=f"{v}.json",
+                        local_dir=path if _path_is_local_dir else str(LOCAL_WEIGHTS),
+                        local_dir_use_symlinks=False,
+                    )
+                    _dl_safe = _hf_dl(
+                        repo_id=_repo_id, filename=f"{v}.safetensors",
+                        local_dir=path if _path_is_local_dir else str(LOCAL_WEIGHTS),
+                        local_dir_use_symlinks=False,
+                    )
+                    gc.collect()
+
+                    # Now load from whichever path the files landed at
+                    _load_path = local_path
+                    if not _os.path.exists(f"{_load_path}.json"):
+                        # hf_hub_download might have put them in LOCAL_WEIGHTS
+                        _load_path = f"{LOCAL_WEIGHTS}/{v}"
+
+                    _loaded[k] = _models_mod.from_pretrained(_load_path)
                     sys.__stdout__.write(" ✓\n")
+                    done = True
                 except Exception as e:
                     sys.__stdout__.write(f" ❌ {e}\n")
                     raise
 
-            # Free residual CPU buffers between sub-models
             _gc.collect()
 
         pipeline = cls(_loaded)
