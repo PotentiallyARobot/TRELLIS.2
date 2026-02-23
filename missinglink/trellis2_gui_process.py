@@ -1491,17 +1491,55 @@ def run_gui():
                 f"⚠ Proxy URL not reachable (last error: {_last_proxy_err}).\n"
                 f"  Falling back to embedded iframe in notebook...\n"
             )
+
+            # Shared JS snippet: "Open in new tab" button that resolves
+            # the proxy URL client-side (works even when server-side
+            # requests.get couldn't reach it — browser auth is different).
+            _POPOUT_BTN_JS = """
+            <script>
+            (function() {
+                var btn = document.getElementById('trellis-popout-btn');
+                if (!btn) return;
+                btn.addEventListener('click', async function() {
+                    btn.textContent = 'Opening...';
+                    btn.style.opacity = '0.6';
+                    try {
+                        var url = await google.colab.kernel.proxyPort(%d, {cache: false});
+                        if (url && !url.startsWith('http')) url = 'https://' + url;
+                        window.open(url, '_blank');
+                        btn.textContent = '↗ Open in new tab';
+                        btn.style.opacity = '1';
+                    } catch(e) {
+                        btn.textContent = '⚠ Failed — try again';
+                        btn.style.opacity = '1';
+                        console.error('proxyPort error:', e);
+                    }
+                });
+            })();
+            </script>
+            """ % PORT
+
+            _POPOUT_BTN_HTML = (
+                '<button id="trellis-popout-btn" style="'
+                'margin-left:12px;padding:6px 14px;'
+                'background:#E8A917;color:#141414;border:none;border-radius:6px;'
+                'font-family:monospace;font-size:13px;font-weight:bold;cursor:pointer;'
+                '">↗ Open in new tab</button>'
+            )
+
             _iframe_ok = False
             try:
                 from google.colab import output as _colab_output
                 _colab_output.serve_kernel_port_as_iframe(PORT, height='820')
                 _launch_mode = "iframe"
                 _iframe_ok = True
-                display(_HTML("""
-                <div style="margin:8px 0 4px;padding:10px 16px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
+                display(_HTML(f"""
+                <div style="margin:8px 0 4px;padding:10px 16px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
                     <span style="color:#E8A917;font-weight:bold;">🔺 TRELLIS.2 Generator</span>
-                    <span style="color:#8A8A8A;font-size:13px;"> — embedded above ↑  (scroll up if needed)</span>
+                    <span style="color:#8A8A8A;font-size:13px;"> — embedded above ↑</span>
+                    {_POPOUT_BTN_HTML}
                 </div>
+                {_POPOUT_BTN_JS}
                 """))
             except Exception as _iframe_err:
                 sys.__stdout__.write(f"  ⚠ iframe fallback failed: {_iframe_err}\n")
@@ -1512,10 +1550,12 @@ def run_gui():
                     from google.colab import output as _colab_output
                     _colab_output.serve_kernel_port_as_window(PORT, anchor_text="🔺 Click to open TRELLIS.2 Generator")
                     _launch_mode = "window"
-                    display(_HTML("""
-                    <div style="margin:8px 0;padding:10px 16px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
-                        <span style="color:#8A8A8A;font-size:13px;">Click the link above to open the UI in a new tab.</span>
+                    display(_HTML(f"""
+                    <div style="margin:8px 0;padding:10px 16px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
+                        <span style="color:#8A8A8A;font-size:13px;">Click the link above to open the UI, or:</span>
+                        {_POPOUT_BTN_HTML}
                     </div>
+                    {_POPOUT_BTN_JS}
                     """))
                 except Exception as _window_err:
                     sys.__stdout__.write(f"  ⚠ window fallback also failed: {_window_err}\n")
@@ -1532,8 +1572,24 @@ def run_gui():
                             iframe.style.border = '2px solid #E8A917';
                             iframe.style.borderRadius = '12px';
                             document.querySelector('#output-area').appendChild(iframe);
+
+                            // Pop-out button
+                            const btn = document.createElement('button');
+                            btn.textContent = '↗ Open TRELLIS.2 in new tab';
+                            btn.style.cssText = 'margin:8px 0;padding:8px 16px;background:#E8A917;color:#141414;border:none;border-radius:6px;font-family:monospace;font-size:13px;font-weight:bold;cursor:pointer;';
+                            btn.onclick = async function() {
+                                btn.textContent = 'Opening...';
+                                try {
+                                    const u = await google.colab.kernel.proxyPort(%d, {cache: false});
+                                    window.open(u.startsWith('http') ? u : 'https://' + u, '_blank');
+                                    btn.textContent = '↗ Open TRELLIS.2 in new tab';
+                                } catch(e) {
+                                    btn.textContent = '⚠ Failed — try again';
+                                }
+                            };
+                            document.querySelector('#output-area').appendChild(btn);
                         })();
-                        """ % PORT))
+                        """ % (PORT, PORT)))
                         _launch_mode = "js_iframe"
                     except Exception as _js_err:
                         raise RuntimeError(
