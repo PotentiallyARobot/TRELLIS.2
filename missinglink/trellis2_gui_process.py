@@ -39,59 +39,6 @@ def run_gui():
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    # ── EARLY SWAP: must happen before ANY heavy downloads or imports ──
-    # HuggingFace snapshot_download can buffer 16+ GB through RAM even when
-    # writing to disk. On Colab T4 free tier (~12.7 GB RAM) this triggers
-    # the OOM killer before our model-loading swap would even be created.
-    # So we create swap FIRST, using only stdlib (no torch/psutil yet).
-    _SWAP_PATH = "/content/_trellis_swap"
-    _SWAP_SIZE_GB = 12  # generous: covers download + deserialization + overhead
-
-    def _early_swap_setup():
-        """Create swap file using only stdlib. Runs before torch/psutil import."""
-        try:
-            # Read /proc/meminfo to get RAM without psutil
-            mem_total_kb = 0
-            swap_total_kb = 0
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        mem_total_kb = int(line.split()[1])
-                    elif line.startswith("SwapTotal:"):
-                        swap_total_kb = int(line.split()[1])
-            total_gb = (mem_total_kb + swap_total_kb) / 1e6
-            if total_gb >= 24.0:
-                sys.__stdout__.write(f"💾 RAM+Swap: {total_gb:.1f} GB — sufficient, skipping swap setup\n")
-                return
-            if os.path.exists(_SWAP_PATH):
-                sys.__stdout__.write(f"💾 Swap file already exists\n")
-                return
-            # Check disk space
-            st = os.statvfs("/content")
-            disk_free_gb = (st.f_bavail * st.f_frsize) / 1e9
-            if disk_free_gb < _SWAP_SIZE_GB + 5:
-                sys.__stdout__.write(f"💾 Not enough disk ({disk_free_gb:.1f} GB free), skipping swap\n")
-                return
-            sys.__stdout__.write(f"💾 Creating {_SWAP_SIZE_GB} GB swap file (needed for download + model loading)...\n")
-            sys.__stdout__.flush()
-            ret = os.system(f"fallocate -l {_SWAP_SIZE_GB}G {_SWAP_PATH} 2>/dev/null")
-            if ret != 0:
-                os.system(f"dd if=/dev/zero of={_SWAP_PATH} bs=1M count={_SWAP_SIZE_GB * 1024} status=none 2>/dev/null")
-            os.system(f"chmod 600 {_SWAP_PATH}")
-            os.system(f"mkswap {_SWAP_PATH} >/dev/null 2>&1")
-            os.system(f"swapon {_SWAP_PATH} 2>/dev/null")
-            # Verify
-            new_swap_kb = 0
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("SwapTotal:"):
-                        new_swap_kb = int(line.split()[1])
-            sys.__stdout__.write(f"   ✅ Swap active: {new_swap_kb / 1e6:.1f} GB\n")
-        except Exception as e:
-            sys.__stdout__.write(f"   ⚠ Early swap setup failed (non-fatal): {e}\n")
-
-    _early_swap_setup()
-
     if not os.path.exists("/content/drive/MyDrive"):
         from google.colab import drive
         drive.mount("/content/drive", force_remount=False)
@@ -102,12 +49,6 @@ def run_gui():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "flask"])
         from flask import Flask, request, jsonify, send_file, Response
     from werkzeug.utils import secure_filename
-
-    try:
-        import psutil
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "psutil"])
-        import psutil
 
     IN_COLAB = False
     try:
@@ -184,100 +125,8 @@ def run_gui():
                 copy_weights(DRIVE_WEIGHTS, LOCAL_WEIGHTS, label="Drive → local"); return str(LOCAL_WEIGHTS)
             except Exception as e:
                 print(f"  ⚠ Copy failed ({e}), downloading from HuggingFace.")
-
-        # ── Minimal-RAM download: raw HTTP streaming, no HF library ──────
-        # huggingface_hub's snapshot_download and even hf_hub_download
-        # buffer multi-GB files in RAM (seen: 10+ GB spike on T4 free tier
-        # with 12.7 GB total RAM). The ONLY reliable way to prevent this
-        # is to bypass their library entirely and stream with requests.
-        print(f"⬇ Downloading weights from {HF_MODEL_ID} (streaming to disk)...")
-        sys.__stdout__.flush()
-
-        import requests as _req
-
-        LOCAL_WEIGHTS.mkdir(parents=True, exist_ok=True)
-        _HF_API = f"https://huggingface.co/api/models/{HF_MODEL_ID}"
-        _HF_DL  = f"https://huggingface.co/{HF_MODEL_ID}/resolve/main"
-        _CHUNK  = 8 * 1024 * 1024   # 8 MB chunks — tiny RAM footprint
-
-        try:
-            # Get file list from HF API
-            _resp = _req.get(_HF_API, timeout=30)
-            _resp.raise_for_status()
-            _siblings = _resp.json().get("siblings", [])
-            _files = [s["rfilename"] for s in _siblings]
-            print(f"  {len(_files)} files to download")
-
-            for _i, _fname in enumerate(_files, 1):
-                _dest = LOCAL_WEIGHTS / _fname
-                _dest.parent.mkdir(parents=True, exist_ok=True)
-
-                # Skip if already downloaded
-                _url = f"{_HF_DL}/{_fname}"
-                _expected_size = None
-
-                # Check if file exists and is complete
-                if _dest.exists() and _dest.stat().st_size > 0:
-                    # Quick HEAD to verify size matches
-                    try:
-                        _head = _req.head(_url, allow_redirects=True, timeout=10)
-                        _expected_size = int(_head.headers.get("content-length", 0))
-                        if _expected_size > 0 and _dest.stat().st_size == _expected_size:
-                            sys.__stdout__.write(f"  [{_i}/{len(_files)}] {_fname} ✓ (cached)\n")
-                            sys.__stdout__.flush()
-                            continue
-                    except:
-                        pass
-
-                # Stream download
-                sys.__stdout__.write(f"  [{_i}/{len(_files)}] {_fname}...")
-                sys.__stdout__.flush()
-
-                _r = _req.get(_url, stream=True, timeout=60)
-                _r.raise_for_status()
-                _total = int(_r.headers.get("content-length", 0))
-                _downloaded = 0
-
-                _tmp = _dest.with_suffix(_dest.suffix + ".tmp")
-                with open(_tmp, "wb") as _f:
-                    for _chunk in _r.iter_content(chunk_size=_CHUNK):
-                        _f.write(_chunk)
-                        _downloaded += len(_chunk)
-                        if _total > 0:
-                            _pct = _downloaded * 100 // _total
-                            _mb = _downloaded / 1e6
-                            _total_mb = _total / 1e6
-                            sys.__stdout__.write(f"\r  [{_i}/{len(_files)}] {_fname}  {_pct}% ({_mb:.0f}/{_total_mb:.0f} MB)   ")
-                            sys.__stdout__.flush()
-                _r.close()
-
-                # Atomic rename
-                _tmp.rename(_dest)
-                sys.__stdout__.write(f"\r  [{_i}/{len(_files)}] {_fname}  ✅ ({_downloaded / 1e6:.0f} MB)          \n")
-                sys.__stdout__.flush()
-
-                # Explicitly free the response buffer
-                del _r
-                gc.collect()
-
-            print(f"  ✅ All {len(_files)} files downloaded to {LOCAL_WEIGHTS}")
-            return str(LOCAL_WEIGHTS)
-
-        except Exception as e:
-            print(f"\n  ⚠ Streaming download failed: {e}")
-            print(f"  Falling back to hf_hub_download (may use more RAM)...")
-            try:
-                from huggingface_hub import snapshot_download
-                snapshot_download(
-                    HF_MODEL_ID,
-                    local_dir=str(LOCAL_WEIGHTS),
-                    local_dir_use_symlinks=False,
-                    max_workers=1,  # single thread to limit RAM
-                )
-                return str(LOCAL_WEIGHTS)
-            except Exception as e2:
-                print(f"  ⚠ Fallback also failed: {e2}")
-                return HF_MODEL_ID
+        print(f"⬇ Downloading weights from {HF_MODEL_ID}...");
+        return HF_MODEL_ID
 
     def cache_weights_to_drive():
         if DRIVE_WEIGHTS.exists() and any(DRIVE_WEIGHTS.iterdir()): return
@@ -329,377 +178,43 @@ def run_gui():
     if "/content" not in sys.path:
         sys.path.insert(0, "/content")
 
-    # ── Monkey-patch Pipeline.from_pretrained for low-RAM loading ──────
-    # The stock base.py loads all sub-models without gc.collect() between
-    # them, and its except branch triggers parallel HF downloads that
-    # spike system RAM.  We replace it with a version that:
-    #   1. Always tries local path first (our pre-downloaded files)
-    #   2. gc.collect() between each sub-model load
-    #   3. Falls back to single-file HF download only as last resort
-    #   4. Prints progress so the user knows what's happening
-    def _patched_pipeline_from_pretrained(cls, path, config_file="pipeline.json"):
-        import os as _os, json as _json, gc as _gc
-        from trellis2 import models as _models_mod
-
-        is_local = _os.path.exists(f"{path}/{config_file}")
-        _path_is_local_dir = _os.path.isdir(path)
-
-        if is_local:
-            cfg_path = f"{path}/{config_file}"
-        else:
-            from huggingface_hub import hf_hub_download
-            cfg_path = hf_hub_download(path, config_file)
-
-        with open(cfg_path, 'r') as f:
-            args = _json.load(f)['args']
-
-        _loaded = {}
-        total = len(args['models'])
-        for i, (k, v) in enumerate(args['models'].items(), 1):
-            if hasattr(cls, 'model_names_to_load') and k not in cls.model_names_to_load:
-                continue
-
-            done = False
-
-            # ── Detect if v is a cross-repo HF reference ──
-            # e.g. "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"
-            # These point to a DIFFERENT HuggingFace repo, not our local weights.
-            _v_parts = v.split("/")
-            _is_cross_repo = (len(_v_parts) >= 3 and not v.startswith("ckpts"))
-
-            # ── Try 1: load from local files ──
-            local_path = f"{path}/{v}"
-            json_exists = _os.path.exists(f"{local_path}.json")
-            safetensors_exists = _os.path.exists(f"{local_path}.safetensors")
-            safetensors_valid = (
-                safetensors_exists
-                and _os.path.getsize(f"{local_path}.safetensors") > 1024
-            )
-
-            if json_exists and safetensors_valid:
-                try:
-                    _sz = _os.path.getsize(f"{local_path}.safetensors") / 1e9
-                    sys.__stdout__.write(f"  [{i}/{total}] {k} (local, {_sz:.2f} GB)...")
-                    sys.__stdout__.flush()
-                    _loaded[k] = _models_mod.from_pretrained(local_path)
-                    sys.__stdout__.write(" ✓\n")
-                    done = True
-                except Exception as e:
-                    sys.__stdout__.write(f" ⚠ {e}\n")
-
-            # ── Try 2: cross-repo reference → let models.__init__ handle it ──
-            if not done and _is_cross_repo:
-                try:
-                    sys.__stdout__.write(f"  [{i}/{total}] {k} (cross-repo: {v})...")
-                    sys.__stdout__.flush()
-                    _loaded[k] = _models_mod.from_pretrained(v)
-                    sys.__stdout__.write(" ✓\n")
-                    done = True
-                except Exception as e:
-                    sys.__stdout__.write(f" ⚠ cross-repo failed: {e}\n")
-
-            # ── Try 3: download from primary HF repo ──
-            if not done:
-                from huggingface_hub import hf_hub_download as _hf_dl
-                _repo_id = _os.environ.get("TRELLIS2_HF_REPO", HF_MODEL_ID)
-                _dl_dir = path if _path_is_local_dir else str(LOCAL_WEIGHTS)
-
-                sys.__stdout__.write(f"  [{i}/{total}] {k} (HF download: {_repo_id}/{v})...")
-                sys.__stdout__.flush()
-                try:
-                    _hf_dl(
-                        repo_id=_repo_id, filename=f"{v}.json",
-                        local_dir=_dl_dir, local_dir_use_symlinks=False,
-                    )
-                    _hf_dl(
-                        repo_id=_repo_id, filename=f"{v}.safetensors",
-                        local_dir=_dl_dir, local_dir_use_symlinks=False,
-                    )
-                    gc.collect()
-
-                    _load_path = f"{_dl_dir}/{v}"
-                    _loaded[k] = _models_mod.from_pretrained(_load_path)
-                    sys.__stdout__.write(" ✓\n")
-                except Exception as e:
-                    sys.__stdout__.write(f" ❌ {e}\n")
-                    raise
-
-            _gc.collect()
-
-        pipeline = cls(_loaded)
-        pipeline._pretrained_args = args
-        return pipeline
-
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
     from trellis2.utils import render_utils
     from trellis2.renderers import EnvMap
     import o_voxel
     import missinglink.postprocess_parallel as pp
 
-    # Apply the monkey-patch to the base Pipeline class
-    from trellis2.pipelines.base import Pipeline as _BasePipeline
-    _BasePipeline.from_pretrained = classmethod(_patched_pipeline_from_pretrained)
-    print("✅ Pipeline.from_pretrained patched for low-memory loading")
-
     GPU_NAME = torch.cuda.get_device_name(0)
     TOTAL_VRAM = torch.cuda.get_device_properties(0).total_memory / 1e9
 
-    # ══════════════════════════════════════════════════════════════
-    # GPU PROFILE — automatically tunes every parameter to the hardware
-    # ══════════════════════════════════════════════════════════════
-    #
-    #   T4  (15 GB, free Colab)  → conservative: fewer steps, lower res,
-    #                               smaller textures, swap file needed
-    #   L4  (24 GB, Colab Pro)   → balanced: full steps, good textures
-    #   A100 (40/80 GB)          → full quality: max steps, 4K textures,
-    #                               high-res renders, no swap needed
-    #
-    # The profile is a dict so every downstream consumer can just read
-    # GPU_PROFILE["key"] instead of scattered if/else blocks.
-
-    def _detect_gpu_profile():
-        name_lower = GPU_NAME.lower()
-        vram = TOTAL_VRAM
-
-        # ── Identify the GPU tier ──
-        if "a100" in name_lower or "h100" in name_lower or vram >= 38:
-            tier = "high"
-        elif "l4" in name_lower or "a10" in name_lower or "l40" in name_lower or (22 <= vram < 38):
-            tier = "mid"
-        else:
-            # T4, V100-16GB, or anything with <22 GB
-            tier = "low"
-
-        profiles = {
-            # ── HIGH: A100 / H100 (40–80 GB) ─────────────────────
-            "high": {
-                "tier":               "high",
-                "label":              f"🟢 {GPU_NAME} ({vram:.0f} GB) — full quality",
-                # Sampler steps (more = higher quality, slower)
-                "ss_steps":           20,    # sparse structure
-                "shape_steps":        20,    # shape SLAT
-                "tex_steps":          20,    # texture SLAT
-                # Default texture & mesh settings
-                "texture_size":       4096,
-                "decimate_target":    1_000_000,
-                # Render settings
-                "video_resolution":   1024,
-                "render_max_faces":   16_000_000,
-                # Swap
-                "swap_gb":            0,     # not needed
-                # Loading strategy
-                "incremental_load":   False, # .cuda() in one shot is fine
-            },
-            # ── MID: L4 / A10 / L40S (24 GB) ─────────────────────
-            "mid": {
-                "tier":               "mid",
-                "label":              f"🟡 {GPU_NAME} ({vram:.0f} GB) — balanced",
-                "ss_steps":           16,
-                "shape_steps":        16,
-                "tex_steps":          16,
-                "texture_size":       4096,
-                "decimate_target":    1_000_000,
-                "video_resolution":   768,
-                "render_max_faces":   16_000_000,
-                "swap_gb":            0,
-                "incremental_load":   False,
-            },
-            # ── LOW: T4 / V100-16GB (≤16 GB) ─────────────────────
-            "low": {
-                "tier":               "low",
-                "label":              f"🔴 {GPU_NAME} ({vram:.0f} GB) — memory-optimised",
-                "ss_steps":           12,
-                "shape_steps":        12,
-                "tex_steps":          12,
-                "texture_size":       2048,  # 4096 can OOM on bake
-                "decimate_target":    500_000,
-                "video_resolution":   512,
-                "render_max_faces":   8_000_000,  # safer for T4
-                "swap_gb":            8,
-                "incremental_load":   True,  # sub-model-at-a-time
-            },
-        }
-        return profiles[tier]
-
-    GPU_PROFILE = _detect_gpu_profile()
-    print(f"GPU: {GPU_PROFILE['label']}")
-
-    # Apply profile to globals
-    RENDER_MAX_FACES = GPU_PROFILE["render_max_faces"]
-
-    # ── Swap file: use SSD as overflow RAM during model loading ──────
-    # Colab T4 free tier has ~12.7 GB RAM but from_pretrained needs ~8 GB
-    # just for deserialization. A swap file on the local SSD acts as
-    # temporary overflow so the OOM killer doesn't strike.
-    SWAP_PATH = _SWAP_PATH  # reuse from early setup
-    SWAP_SIZE_GB = _SWAP_SIZE_GB
-
-    # Swap was already set up at the very start of run_gui() (before imports).
-    # The GPU_PROFILE["swap_gb"] just tells us whether this GPU tier needs it;
-    # the early setup always creates it on low-RAM systems regardless of tier.
-    if GPU_PROFILE["swap_gb"] == 0 and os.path.exists(SWAP_PATH):
-        # High/mid tier GPU with plenty of RAM — remove swap to free disk
-        try:
-            os.system(f"swapoff {SWAP_PATH} 2>/dev/null")
-            os.remove(SWAP_PATH)
-            print(f"💾 Swap not needed for {GPU_PROFILE['tier']} tier — removed, {SWAP_SIZE_GB} GB disk freed")
-        except:
-            pass
+    # Max faces for render — above this the nvdiffrec renderer can trigger
+    # illegal memory access which poisons the entire CUDA context.
+    RENDER_MAX_FACES = 16_000_000
 
     print(f"GPU: {GPU_NAME} | VRAM: {TOTAL_VRAM:.1f} GB")
-
-    # ── Memory info helper ──
-    def _mem_report():
-        """Return (sys_ram_used_gb, sys_ram_total_gb, vram_used_gb)."""
-        import psutil
-        vm = psutil.virtual_memory()
-        return vm.used / 1e9, vm.total / 1e9, torch.cuda.memory_allocated() / 1e9
-
-    def _drop_caches():
-        """Best-effort: free OS page-cache (helps a lot on Colab T4)."""
-        gc.collect()
-        try:
-            torch.cuda.empty_cache()
-        except:
-            pass
-        gc.collect()
-        try:
-            os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")
-        except:
-            pass
-
-    _ram_used, _ram_total, _ = _mem_report()
-    print(f"System RAM: {_ram_used:.1f} / {_ram_total:.1f} GB used")
     print("Loading TRELLIS.2 pipeline...")
     weights_path = resolve_weights()
-
-    # Tell base.py where the local weights are so it never triggers HF downloads
-    os.environ["TRELLIS2_LOCAL_WEIGHTS"] = weights_path
-    os.environ["TRELLIS2_DOWNLOAD_DIR"] = str(LOCAL_WEIGHTS)
-
-    # ── Phase 1: Deserialize model (CPU) ──
-    _drop_caches()
-    _t0 = time.time()
-    _ram0, _, _ = _mem_report()
-    print(f"📦 Deserializing model weights into CPU RAM...")
-    sys.__stdout__.flush()
+    downloaded_from_hf = (weights_path == HF_MODEL_ID)
     trellis_pipe = Trellis2ImageTo3DPipeline.from_pretrained(weights_path)
-    _t1 = time.time()
-    _ram1, _ram_tot, _ = _mem_report()
-    print(f"   Done in {_t1 - _t0:.0f}s | RAM: {_ram1:.1f} / {_ram_tot:.1f} GB (+{_ram1 - _ram0:.1f} GB)")
+    trellis_pipe.cuda()
 
-    # ── Phase 2: Move models to GPU ──
-    if GPU_PROFILE["incremental_load"]:
-        # LOW-MEMORY PATH: move each sub-model individually, free CPU copies
-        # between transfers. Peak RAM ≈ largest single sub-model.
-        print(f"🔄 Moving models to GPU (low-memory: one sub-model at a time)...")
-        sys.__stdout__.flush()
-
-        _moved_count = 0
-        _moved_names = []
-
-        # Collect all nn.Module attributes on the pipeline
-        _all_submodules = {}
-
-        # 1. Named models dict (the main ones)
-        if hasattr(trellis_pipe, 'models') and isinstance(trellis_pipe.models, dict):
-            for name, model in trellis_pipe.models.items():
-                _all_submodules[f"models.{name}"] = model
-
-        # 2. image_cond_model (usually DINOv2 or similar)
-        if hasattr(trellis_pipe, 'image_cond_model'):
-            _all_submodules["image_cond_model"] = trellis_pipe.image_cond_model
-
-        # 3. Any other nn.Module attributes we missed
-        for attr_name in dir(trellis_pipe):
-            if attr_name.startswith('_'):
-                continue
-            try:
-                attr = getattr(trellis_pipe, attr_name)
-                if isinstance(attr, torch.nn.Module) and attr_name not in _all_submodules:
-                    if any(True for _ in attr.parameters()):
-                        _all_submodules[attr_name] = attr
-            except:
-                pass
-
-        for _name, _module in _all_submodules.items():
-            _on_cuda = False
-            try:
-                _on_cuda = next(_module.parameters()).is_cuda
-            except StopIteration:
-                continue
-            except:
-                pass
-
-            if not _on_cuda:
-                _param_bytes = sum(p.numel() * p.element_size() for p in _module.parameters())
-                _param_gb = _param_bytes / 1e9
-                sys.__stdout__.write(f"   → {_name} ({_param_gb:.2f} GB)...")
-                sys.__stdout__.flush()
-
-                _module.to("cuda")
-                gc.collect()
-
-                _moved_count += 1
-                _moved_names.append(_name)
-                _ram_now, _, _vram_now = _mem_report()
-                sys.__stdout__.write(f" ✓  RAM: {_ram_now:.1f} GB | VRAM: {_vram_now:.1f} GB\n")
-                sys.__stdout__.flush()
-
-        torch.cuda.synchronize()
-        _drop_caches()
-        _t2 = time.time()
-        _ram2, _, _vram2 = _mem_report()
-        print(f"   Moved {_moved_count} sub-models in {_t2 - _t1:.0f}s | RAM: {_ram2:.1f} GB | VRAM: {_vram2:.1f} / {TOTAL_VRAM:.1f} GB")
-
-        # Safety: ensure anything missed also gets moved
+    if downloaded_from_hf:
         try:
-            trellis_pipe.cuda()
-        except Exception as _e:
-            sys.__stdout__.write(f"   ⚠ Final .cuda() pass: {_e}\n")
-    else:
-        # FAST PATH: plenty of RAM, just move everything in one shot
-        _vram_before = torch.cuda.memory_allocated() / 1e9
-        print("🔄 Moving model to GPU...")
-        sys.__stdout__.flush()
-        trellis_pipe.cuda()
-        torch.cuda.synchronize()
-        _t2 = time.time()
-        _vram2 = torch.cuda.memory_allocated() / 1e9
-        print(f"   Done in {_t2 - _t1:.0f}s | VRAM: {_vram2:.1f} / {TOTAL_VRAM:.1f} GB")
+            from huggingface_hub import snapshot_download
+            hf_cache_path = snapshot_download(HF_MODEL_ID, local_files_only=True)
+            if not LOCAL_WEIGHTS.exists():
+                print(f"\n📁 Copying HF cache to {LOCAL_WEIGHTS}...")
+                copy_weights(hf_cache_path, LOCAL_WEIGHTS, label="HF cache → local")
+        except Exception as e:
+            print(f"  ⚠ Could not copy HF cache: {e}")
+        threading.Thread(target=cache_weights_to_drive, daemon=True).start()
 
-    _drop_caches()
-
-    # ── Cache weights to Google Drive for faster next launch ──
-    if not DRIVE_WEIGHTS.exists() or not any(DRIVE_WEIGHTS.iterdir()):
-        if LOCAL_WEIGHTS.exists() and any(LOCAL_WEIGHTS.iterdir()):
-            print("💾 Saving weights to Google Drive in background...")
-            threading.Thread(target=cache_weights_to_drive, daemon=True).start()
-
-    print("🌄 Loading HDRI environment map...")
-    sys.__stdout__.flush()
     hdri = REPO_DIR / "assets" / "hdri" / "forest.exr"
     envmap = EnvMap(torch.tensor(
         cv2.cvtColor(cv2.imread(str(hdri), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
         dtype=torch.float32, device="cuda",
     ))
-    _t3 = time.time()
-    _total_load = _t3 - _t0
-    _ram_final, _ram_total_final, _vram_final = _mem_report()
-    print(
-        f"✅ TRELLIS.2 pipeline loaded — total: {_total_load:.0f}s\n"
-        f"   RAM: {_ram_final:.1f} / {_ram_total_final:.1f} GB | "
-        f"VRAM: {_vram_final:.1f} / {TOTAL_VRAM:.1f} GB"
-    )
-
-    # ── Remove swap file: models are on GPU, no longer needed ──
-    if os.path.exists(SWAP_PATH):
-        try:
-            os.system(f"swapoff {SWAP_PATH} 2>/dev/null")
-            os.remove(SWAP_PATH)
-            print(f"💾 Swap file removed — {SWAP_SIZE_GB} GB disk freed")
-        except:
-            pass
+    print("✅ TRELLIS.2 pipeline loaded")
 
     # ── CUDA safety helpers ──
     def cuda_ok():
@@ -1183,9 +698,9 @@ def run_gui():
                         set_phase(1)
                         out = trellis_pipe.run(
                             [image], image_weights=[1.0],
-                            sparse_structure_sampler_params={"steps": GPU_PROFILE["ss_steps"]},
-                            shape_slat_sampler_params={"steps": GPU_PROFILE["shape_steps"]},
-                            tex_slat_sampler_params={"steps": GPU_PROFILE["tex_steps"]},
+                            sparse_structure_sampler_params={"steps": 12},
+                            shape_slat_sampler_params={"steps": 12},
+                            tex_slat_sampler_params={"steps": 12},
                         )
                         if not out:
                             raise RuntimeError("Empty pipeline result")
@@ -1235,7 +750,6 @@ def run_gui():
                             media_path, media_type = do_render(
                                 mesh, render_mode, out_path, base,
                                 fps=s["fps"],
-                                resolution=s.get("video_resolution", GPU_PROFILE["video_resolution"]),
                                 sprite_directions=s.get("sprite_directions", 16),
                                 sprite_size=s.get("sprite_size", 256),
                                 sprite_pitch=s.get("sprite_pitch", 0.52),
@@ -1424,18 +938,7 @@ def run_gui():
 
     @app.route("/api/keepalive")
     def api_keepalive():
-        return jsonify({
-            "ok": True,
-            "gpu": GPU_NAME,
-            "vram_gb": round(TOTAL_VRAM, 1),
-            "tier": GPU_PROFILE["tier"],
-        })
-
-    @app.route("/api/gpu_profile")
-    def api_gpu_profile():
-        return jsonify({
-            k: v for k, v in GPU_PROFILE.items()
-        })
+        return jsonify({"ok": True})
 
     # ── HTML PAGE ──
 
@@ -1677,7 +1180,7 @@ def run_gui():
     function poll(jobId,type,cfg){if(timers[type])clearInterval(timers[type]);if(!localStart[type])localStart[type]=Date.now();timers[type]=setInterval(async()=>{try{const r=await fetch('/api/status/'+jobId);const d=await r.json();const p=d.progress||{};const elapsed=p.elapsed||((Date.now()-localStart[type])/1000);$(cfg.timer).textContent=fmtTime(elapsed);const pct=p.pct||0;$(cfg.fill).style.width=pct+'%';$(cfg.pct).textContent=Math.round(pct)+'%';$(cfg.phase).textContent=p.phase||'';if(cfg.image&&p.image_num&&p.total)$(cfg.image).textContent='Image '+p.image_num+' of '+p.total+(p.name?' — '+p.name:'');if(d.status==='done')$(cfg.status).innerHTML='<span class="done-icon">✅</span> Complete';else $(cfg.status).innerHTML='<span class="spinner"></span> '+cfg.statusText;if(d.log){const b=$(cfg.log);b.textContent=d.log.join('\n');b.scrollTop=b.scrollHeight}if(cfg.console){const cr=await fetch('/api/console');const cd=await cr.json();const cel=$(cfg.console);cel.textContent=cd.lines.join('\n');cel.scrollTop=cel.scrollHeight}if(d.status==='done'){clearInterval(timers[type]);timers[type]=null;delete localStart[type];if(cfg.btn){cfg.btn.disabled=false;cfg.btn.textContent=cfg.btnText}cfg.renderFn(d.results||[])}}catch(e){console.error(e)}},800)}
 
     /* ── Generate ── */
-    async function startGen(){if(!files3d.length)return;const btn=$('genBtn3d');btn.disabled=true;btn.textContent='Uploading images...';const fd=new FormData();files3d.forEach(f=>fd.append('images',f));fd.append('settings',JSON.stringify({output_dir:$('sOutDir').value,fps:parseInt($('sFps').value),texture_size:parseInt($('sTexture').value),decimate_target:parseInt($('sDecimate').value),remesh:$('sRemesh').checked,remesh_band:parseFloat($('sRemeshBand').value),render_mode:selectedRenderMode,sprite_directions:parseInt($('sSpriteDirections').value),sprite_size:parseInt($('sSpriteSize').value),sprite_pitch:parseFloat($('sSpritePitch').value),doom_directions:parseInt($('sDoomDirections').value),doom_size:parseInt($('sDoomSize').value),doom_pitch:parseFloat($('sDoomPitch').value)}));try{const r=await fetch('/api/generate',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Generating...';show('progressPanel3d');show('logBox3d');$('logBox3d').textContent='';hide('results3d');$('resultsList3d').innerHTML='';$('pFill3d').style.width='0%';$('pPct3d').textContent='0%';localStart['generate']=Date.now();poll(d.job_id,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:btn,btnText:'Generate 3D models →',renderFn:render3d})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate 3D models →'}}
+    async function startGen(){if(!files3d.length)return;const btn=$('genBtn3d');btn.disabled=true;btn.textContent='Uploading images...';const fd=new FormData();files3d.forEach(f=>fd.append('images',f));fd.append('settings',JSON.stringify({output_dir:$('sOutDir').value,fps:parseInt($('sFps').value),texture_size:parseInt($('sTexture').value),decimate_target:parseInt($('sDecimate').value),remesh:$('sRemesh').checked,remesh_band:parseFloat($('sRemeshBand').value),render_mode:selectedRenderMode,video_resolution:512,sprite_directions:parseInt($('sSpriteDirections').value),sprite_size:parseInt($('sSpriteSize').value),sprite_pitch:parseFloat($('sSpritePitch').value),doom_directions:parseInt($('sDoomDirections').value),doom_size:parseInt($('sDoomSize').value),doom_pitch:parseFloat($('sDoomPitch').value)}));try{const r=await fetch('/api/generate',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Generating...';show('progressPanel3d');show('logBox3d');$('logBox3d').textContent='';hide('results3d');$('resultsList3d').innerHTML='';$('pFill3d').style.width='0%';$('pPct3d').textContent='0%';localStart['generate']=Date.now();poll(d.job_id,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:btn,btnText:'Generate 3D models →',renderFn:render3d})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate 3D models →'}}
 
     /* ── Render results — handles all media types including RTS and Doom sprites ── */
     function render3d(results){if(!results.length)return;show('results3d');const l=$('resultsList3d');l.innerHTML='';results.forEach(r=>{const c=document.createElement('div');c.className='result-card';let mediaHtml='';
@@ -1724,29 +1227,6 @@ def run_gui():
     /* ── Reconnect ── */
     async function tryReconnect(){try{const r=await fetch('/api/active');const d=await r.json();if(d.generate){show('progressPanel3d');show('logBox3d');$('genBtn3d').disabled=true;$('genBtn3d').textContent='Generating...';localStart['generate']=Date.now();poll(d.generate,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:$('genBtn3d'),btnText:'Generate 3D models →',renderFn:render3d})}if(d.rmbg){switchTab('rmbg',document.querySelector('[data-tab=rmbg]'));show('progressPanelRmbg');show('logBoxRmbg');$('genBtnRmbg').disabled=true;$('genBtnRmbg').textContent='Processing...';localStart['rmbg']=Date.now();poll(d.rmbg,'rmbg',{timer:'pTimerRmbg',fill:'pFillRmbg',pct:'pPctRmbg',phase:'pPhaseRmbg',status:'pStatusRmbg',statusText:'Processing...',image:null,log:'logBoxRmbg',console:null,btn:$('genBtnRmbg'),btnText:'Remove backgrounds →',renderFn:renderRmbg})}}catch(e){}}
     tryReconnect();
-
-    /* ── Load GPU profile and set UI defaults ── */
-    (async function loadGpuProfile(){
-      try{
-        const r=await fetch('/api/gpu_profile');
-        const p=await r.json();
-        /* Set texture size dropdown */
-        const tex=$('sTexture');
-        if(tex&&p.texture_size){
-          for(let o of tex.options){o.selected=(parseInt(o.value)===p.texture_size)}
-        }
-        /* Set decimate target */
-        const dec=$('sDecimate');
-        if(dec&&p.decimate_target){dec.value=p.decimate_target}
-        /* Show GPU tier badge */
-        const badge=document.getElementById('keepaliveBadge');
-        if(badge){
-          const tierEmoji={high:'🟢',mid:'🟡',low:'🔴'};
-          badge.title=p.label||('GPU tier: '+p.tier);
-          badge.textContent=(tierEmoji[p.tier]||'●')+' '+p.tier.toUpperCase();
-        }
-      }catch(e){console.log('gpu_profile fetch failed:',e)}
-    })();
     </script>
     </body>
     </html>"""
@@ -1762,10 +1242,9 @@ def run_gui():
             return jsonify({"error": "No images"}), 400
         settings = json.loads(request.form.get("settings", "{}"))
         for k, v in [("output_dir", "/content/drive/MyDrive/trellis_models_out"),
-                     ("fps", 15), ("texture_size", GPU_PROFILE["texture_size"]),
-                     ("decimate_target", GPU_PROFILE["decimate_target"]),
+                     ("fps", 15), ("texture_size", 4096), ("decimate_target", 1000000),
                      ("remesh", True), ("remesh_band", 1.0), ("render_mode", "video"),
-                     ("video_resolution", GPU_PROFILE["video_resolution"]),
+                     ("video_resolution", 512),
                      ("sprite_directions", 16), ("sprite_size", 256), ("sprite_pitch", 0.52),
                      ("doom_directions", 8), ("doom_size", 256), ("doom_pitch", 0.0)]:
             settings.setdefault(k, v)
