@@ -50,6 +50,12 @@ def run_gui():
         from flask import Flask, request, jsonify, send_file, Response
     from werkzeug.utils import secure_filename
 
+    try:
+        import psutil
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "psutil"])
+        import psutil
+
     IN_COLAB = False
     try:
         from google.colab.output import eval_js
@@ -192,29 +198,149 @@ def run_gui():
     RENDER_MAX_FACES = 16_000_000
 
     print(f"GPU: {GPU_NAME} | VRAM: {TOTAL_VRAM:.1f} GB")
+
+    # ── Memory info helper ──
+    def _mem_report():
+        """Return (sys_ram_used_gb, sys_ram_total_gb, vram_used_gb)."""
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.used / 1e9, vm.total / 1e9, torch.cuda.memory_allocated() / 1e9
+
+    def _drop_caches():
+        """Best-effort: free OS page-cache (helps a lot on Colab T4)."""
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except:
+            pass
+        gc.collect()
+        try:
+            os.system("sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")
+        except:
+            pass
+
+    _ram_used, _ram_total, _ = _mem_report()
+    print(f"System RAM: {_ram_used:.1f} / {_ram_total:.1f} GB used")
     print("Loading TRELLIS.2 pipeline...")
     weights_path = resolve_weights()
     downloaded_from_hf = (weights_path == HF_MODEL_ID)
+
+    # ── Phase 1: Deserialize model (CPU) ──
+    _drop_caches()
+    _t0 = time.time()
+    _ram0, _, _ = _mem_report()
+    print(f"📦 Deserializing model weights into CPU RAM...")
+    sys.__stdout__.flush()
     trellis_pipe = Trellis2ImageTo3DPipeline.from_pretrained(weights_path)
-    trellis_pipe.cuda()
+    _t1 = time.time()
+    _ram1, _ram_tot, _ = _mem_report()
+    print(f"   Done in {_t1 - _t0:.0f}s | RAM: {_ram1:.1f} / {_ram_tot:.1f} GB (+{_ram1 - _ram0:.1f} GB)")
+
+    # ── Phase 2: Move models to GPU one-by-one ──
+    # Instead of trellis_pipe.cuda() which briefly doubles RAM usage,
+    # we move each sub-model individually and free the CPU copy immediately.
+    # This keeps peak RAM ≈ largest single sub-model instead of entire pipeline.
+    print(f"🔄 Moving models to GPU (low-memory: one sub-model at a time)...")
+    sys.__stdout__.flush()
+
+    _moved_count = 0
+    _moved_names = []
+
+    # Collect all nn.Module attributes on the pipeline
+    _all_submodules = {}
+
+    # 1. Named models dict (the main ones)
+    if hasattr(trellis_pipe, 'models') and isinstance(trellis_pipe.models, dict):
+        for name, model in trellis_pipe.models.items():
+            _all_submodules[f"models.{name}"] = model
+
+    # 2. image_cond_model (usually DINOv2 or similar)
+    if hasattr(trellis_pipe, 'image_cond_model'):
+        _all_submodules["image_cond_model"] = trellis_pipe.image_cond_model
+
+    # 3. Any other nn.Module attributes we missed
+    for attr_name in dir(trellis_pipe):
+        if attr_name.startswith('_'):
+            continue
+        try:
+            attr = getattr(trellis_pipe, attr_name)
+            if isinstance(attr, torch.nn.Module) and attr_name not in _all_submodules:
+                # Check it actually has parameters
+                if any(True for _ in attr.parameters()):
+                    _all_submodules[attr_name] = attr
+        except:
+            pass
+
+    for _name, _module in _all_submodules.items():
+        # Check if already on CUDA
+        _on_cuda = False
+        try:
+            _on_cuda = next(_module.parameters()).is_cuda
+        except StopIteration:
+            continue  # no parameters
+        except:
+            pass
+
+        if not _on_cuda:
+            _param_bytes = sum(p.numel() * p.element_size() for p in _module.parameters())
+            _param_gb = _param_bytes / 1e9
+            sys.__stdout__.write(f"   → {_name} ({_param_gb:.2f} GB)...")
+            sys.__stdout__.flush()
+
+            _module.to("cuda")
+
+            # Force Python to release the CPU tensor storage
+            gc.collect()
+
+            _moved_count += 1
+            _moved_names.append(_name)
+            _ram_now, _, _vram_now = _mem_report()
+            sys.__stdout__.write(f" ✓  RAM: {_ram_now:.1f} GB | VRAM: {_vram_now:.1f} GB\n")
+            sys.__stdout__.flush()
+
+    # Final sync + cleanup
+    torch.cuda.synchronize()
+    _drop_caches()
+    _t2 = time.time()
+    _ram2, _, _vram2 = _mem_report()
+    print(f"   Moved {_moved_count} sub-models in {_t2 - _t1:.0f}s | RAM: {_ram2:.1f} GB | VRAM: {_vram2:.1f} / {TOTAL_VRAM:.1f} GB")
+
+    # Safety: ensure anything missed also gets moved
+    # (this is a no-op if everything was already moved above)
+    try:
+        trellis_pipe.cuda()
+    except Exception as _e:
+        sys.__stdout__.write(f"   ⚠ Final .cuda() pass: {_e}\n")
+
+    _drop_caches()
 
     if downloaded_from_hf:
         try:
             from huggingface_hub import snapshot_download
             hf_cache_path = snapshot_download(HF_MODEL_ID, local_files_only=True)
             if not LOCAL_WEIGHTS.exists():
-                print(f"\n📁 Copying HF cache to {LOCAL_WEIGHTS}...")
+                print(f"\n📁 Caching weights to {LOCAL_WEIGHTS} (speeds up next launch)...")
                 copy_weights(hf_cache_path, LOCAL_WEIGHTS, label="HF cache → local")
         except Exception as e:
             print(f"  ⚠ Could not copy HF cache: {e}")
+        print("💾 Saving weights to Google Drive in background...")
         threading.Thread(target=cache_weights_to_drive, daemon=True).start()
 
+    print("🌄 Loading HDRI environment map...")
+    sys.__stdout__.flush()
     hdri = REPO_DIR / "assets" / "hdri" / "forest.exr"
     envmap = EnvMap(torch.tensor(
         cv2.cvtColor(cv2.imread(str(hdri), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
         dtype=torch.float32, device="cuda",
     ))
-    print("✅ TRELLIS.2 pipeline loaded")
+    _t3 = time.time()
+    _total_load = _t3 - _t0
+    _ram_final, _ram_total_final, _vram_final = _mem_report()
+    print(
+        f"✅ TRELLIS.2 pipeline loaded — total: {_total_load:.0f}s\n"
+        f"   RAM: {_ram_final:.1f} / {_ram_total_final:.1f} GB | "
+        f"VRAM: {_vram_final:.1f} / {TOTAL_VRAM:.1f} GB"
+    )
 
     # ── CUDA safety helpers ──
     def cuda_ok():
