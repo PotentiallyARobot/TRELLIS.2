@@ -185,69 +185,99 @@ def run_gui():
             except Exception as e:
                 print(f"  ⚠ Copy failed ({e}), downloading from HuggingFace.")
 
-        # ── Low-memory download: stream files one-at-a-time to disk ──
-        # HuggingFace's default snapshot_download uses multiple workers and
-        # buffers aggressively, spiking RAM well past the file sizes.
-        # We download each file individually with a small buffer instead.
-        print(f"⬇ Downloading weights from {HF_MODEL_ID} (low-memory mode)...")
+        # ── Minimal-RAM download: raw HTTP streaming, no HF library ──────
+        # huggingface_hub's snapshot_download and even hf_hub_download
+        # buffer multi-GB files in RAM (seen: 10+ GB spike on T4 free tier
+        # with 12.7 GB total RAM). The ONLY reliable way to prevent this
+        # is to bypass their library entirely and stream with requests.
+        print(f"⬇ Downloading weights from {HF_MODEL_ID} (streaming to disk)...")
         sys.__stdout__.flush()
 
+        import requests as _req
+
+        LOCAL_WEIGHTS.mkdir(parents=True, exist_ok=True)
+        _HF_API = f"https://huggingface.co/api/models/{HF_MODEL_ID}"
+        _HF_DL  = f"https://huggingface.co/{HF_MODEL_ID}/resolve/main"
+        _CHUNK  = 8 * 1024 * 1024   # 8 MB chunks — tiny RAM footprint
+
         try:
-            from huggingface_hub import HfApi, hf_hub_download
-            api = HfApi()
-            repo_files = api.list_repo_files(HF_MODEL_ID)
-            LOCAL_WEIGHTS.mkdir(parents=True, exist_ok=True)
+            # Get file list from HF API
+            _resp = _req.get(_HF_API, timeout=30)
+            _resp.raise_for_status()
+            _siblings = _resp.json().get("siblings", [])
+            _files = [s["rfilename"] for s in _siblings]
+            print(f"  {len(_files)} files to download")
 
-            total_files = len(repo_files)
-            for i, fname in enumerate(repo_files, 1):
-                dest = LOCAL_WEIGHTS / fname
-                if dest.exists() and dest.stat().st_size > 0:
-                    sys.__stdout__.write(f"\r  [{i}/{total_files}] {fname} — already exists, skipping")
-                    sys.__stdout__.flush()
-                    continue
+            for _i, _fname in enumerate(_files, 1):
+                _dest = LOCAL_WEIGHTS / _fname
+                _dest.parent.mkdir(parents=True, exist_ok=True)
 
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                sys.__stdout__.write(f"\r  [{i}/{total_files}] {fname}...")
+                # Skip if already downloaded
+                _url = f"{_HF_DL}/{_fname}"
+                _expected_size = None
+
+                # Check if file exists and is complete
+                if _dest.exists() and _dest.stat().st_size > 0:
+                    # Quick HEAD to verify size matches
+                    try:
+                        _head = _req.head(_url, allow_redirects=True, timeout=10)
+                        _expected_size = int(_head.headers.get("content-length", 0))
+                        if _expected_size > 0 and _dest.stat().st_size == _expected_size:
+                            sys.__stdout__.write(f"  [{_i}/{len(_files)}] {_fname} ✓ (cached)\n")
+                            sys.__stdout__.flush()
+                            continue
+                    except:
+                        pass
+
+                # Stream download
+                sys.__stdout__.write(f"  [{_i}/{len(_files)}] {_fname}...")
                 sys.__stdout__.flush()
 
-                # hf_hub_download streams to disk with small buffer;
-                # force_download=False lets it resume; local_dir writes
-                # directly to our target path instead of HF cache.
-                try:
-                    hf_hub_download(
-                        repo_id=HF_MODEL_ID,
-                        filename=fname,
-                        local_dir=str(LOCAL_WEIGHTS),
-                        local_dir_use_symlinks=False,
-                        force_download=False,
-                    )
-                except Exception as dl_err:
-                    sys.__stdout__.write(f" ⚠ {dl_err}\n")
-                    # Retry once
-                    try:
-                        gc.collect()
-                        hf_hub_download(
-                            repo_id=HF_MODEL_ID,
-                            filename=fname,
-                            local_dir=str(LOCAL_WEIGHTS),
-                            local_dir_use_symlinks=False,
-                            force_download=True,
-                        )
-                    except Exception as dl_err2:
-                        sys.__stdout__.write(f" ❌ retry failed: {dl_err2}\n")
-                        raise
+                _r = _req.get(_url, stream=True, timeout=60)
+                _r.raise_for_status()
+                _total = int(_r.headers.get("content-length", 0))
+                _downloaded = 0
 
-                # Free any buffers between files
+                _tmp = _dest.with_suffix(_dest.suffix + ".tmp")
+                with open(_tmp, "wb") as _f:
+                    for _chunk in _r.iter_content(chunk_size=_CHUNK):
+                        _f.write(_chunk)
+                        _downloaded += len(_chunk)
+                        if _total > 0:
+                            _pct = _downloaded * 100 // _total
+                            _mb = _downloaded / 1e6
+                            _total_mb = _total / 1e6
+                            sys.__stdout__.write(f"\r  [{_i}/{len(_files)}] {_fname}  {_pct}% ({_mb:.0f}/{_total_mb:.0f} MB)   ")
+                            sys.__stdout__.flush()
+                _r.close()
+
+                # Atomic rename
+                _tmp.rename(_dest)
+                sys.__stdout__.write(f"\r  [{_i}/{len(_files)}] {_fname}  ✅ ({_downloaded / 1e6:.0f} MB)          \n")
+                sys.__stdout__.flush()
+
+                # Explicitly free the response buffer
+                del _r
                 gc.collect()
 
-            sys.__stdout__.write(f"\n  ✅ All {total_files} files downloaded to {LOCAL_WEIGHTS}\n")
-            sys.__stdout__.flush()
+            print(f"  ✅ All {len(_files)} files downloaded to {LOCAL_WEIGHTS}")
             return str(LOCAL_WEIGHTS)
+
         except Exception as e:
-            print(f"  ⚠ Low-memory download failed: {e}")
-            print(f"  Falling back to standard HuggingFace download...")
-            # Last resort: let from_pretrained handle it (may OOM)
-            return HF_MODEL_ID
+            print(f"\n  ⚠ Streaming download failed: {e}")
+            print(f"  Falling back to hf_hub_download (may use more RAM)...")
+            try:
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    HF_MODEL_ID,
+                    local_dir=str(LOCAL_WEIGHTS),
+                    local_dir_use_symlinks=False,
+                    max_workers=1,  # single thread to limit RAM
+                )
+                return str(LOCAL_WEIGHTS)
+            except Exception as e2:
+                print(f"  ⚠ Fallback also failed: {e2}")
+                return HF_MODEL_ID
 
     def cache_weights_to_drive():
         if DRIVE_WEIGHTS.exists() and any(DRIVE_WEIGHTS.iterdir()): return
@@ -299,11 +329,75 @@ def run_gui():
     if "/content" not in sys.path:
         sys.path.insert(0, "/content")
 
+    # ── Monkey-patch Pipeline.from_pretrained for low-RAM loading ──────
+    # The stock base.py loads all sub-models without gc.collect() between
+    # them, and its except branch triggers parallel HF downloads that
+    # spike system RAM.  We replace it with a version that:
+    #   1. Always tries local path first (our pre-downloaded files)
+    #   2. gc.collect() between each sub-model load
+    #   3. Falls back to single-file HF download only as last resort
+    #   4. Prints progress so the user knows what's happening
+    def _patched_pipeline_from_pretrained(cls, path, config_file="pipeline.json"):
+        import os as _os, json as _json, gc as _gc
+        from trellis2 import models as _models_mod
+
+        is_local = _os.path.exists(f"{path}/{config_file}")
+        if is_local:
+            cfg_path = f"{path}/{config_file}"
+        else:
+            from huggingface_hub import hf_hub_download
+            cfg_path = hf_hub_download(path, config_file)
+
+        with open(cfg_path, 'r') as f:
+            args = _json.load(f)['args']
+
+        _loaded = {}
+        total = len(args['models'])
+        for i, (k, v) in enumerate(args['models'].items(), 1):
+            if hasattr(cls, 'model_names_to_load') and k not in cls.model_names_to_load:
+                continue
+
+            done = False
+            # Try local path first (our pre-downloaded files)
+            local_path = f"{path}/{v}"
+            if _os.path.exists(local_path):
+                try:
+                    sys.__stdout__.write(f"  [{i}/{total}] {k} (local)...")
+                    sys.__stdout__.flush()
+                    _loaded[k] = _models_mod.from_pretrained(local_path)
+                    sys.__stdout__.write(" ✓\n")
+                    done = True
+                except Exception as e:
+                    sys.__stdout__.write(f" ⚠ {e}\n")
+
+            # Fallback: let models.from_pretrained resolve it (may use HF)
+            if not done:
+                try:
+                    sys.__stdout__.write(f"  [{i}/{total}] {k} (HF: {v})...")
+                    sys.__stdout__.flush()
+                    _loaded[k] = _models_mod.from_pretrained(v)
+                    sys.__stdout__.write(" ✓\n")
+                except Exception as e:
+                    sys.__stdout__.write(f" ❌ {e}\n")
+                    raise
+
+            # Free residual CPU buffers between sub-models
+            _gc.collect()
+
+        pipeline = cls(_loaded)
+        pipeline._pretrained_args = args
+        return pipeline
+
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
     from trellis2.utils import render_utils
     from trellis2.renderers import EnvMap
     import o_voxel
     import missinglink.postprocess_parallel as pp
+
+    # Apply the monkey-patch to the base Pipeline class
+    from trellis2.pipelines.base import Pipeline as _BasePipeline
+    _BasePipeline.from_pretrained = classmethod(_patched_pipeline_from_pretrained)
+    print("✅ Pipeline.from_pretrained patched for low-memory loading")
 
     GPU_NAME = torch.cuda.get_device_name(0)
     TOTAL_VRAM = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -436,6 +530,10 @@ def run_gui():
     print(f"System RAM: {_ram_used:.1f} / {_ram_total:.1f} GB used")
     print("Loading TRELLIS.2 pipeline...")
     weights_path = resolve_weights()
+
+    # Tell base.py where the local weights are so it never triggers HF downloads
+    os.environ["TRELLIS2_LOCAL_WEIGHTS"] = weights_path
+    os.environ["TRELLIS2_DOWNLOAD_DIR"] = str(LOCAL_WEIGHTS)
 
     # ── Phase 1: Deserialize model (CPU) ──
     _drop_caches()
