@@ -39,6 +39,59 @@ def run_gui():
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+    # ── EARLY SWAP: must happen before ANY heavy downloads or imports ──
+    # HuggingFace snapshot_download can buffer 16+ GB through RAM even when
+    # writing to disk. On Colab T4 free tier (~12.7 GB RAM) this triggers
+    # the OOM killer before our model-loading swap would even be created.
+    # So we create swap FIRST, using only stdlib (no torch/psutil yet).
+    _SWAP_PATH = "/content/_trellis_swap"
+    _SWAP_SIZE_GB = 12  # generous: covers download + deserialization + overhead
+
+    def _early_swap_setup():
+        """Create swap file using only stdlib. Runs before torch/psutil import."""
+        try:
+            # Read /proc/meminfo to get RAM without psutil
+            mem_total_kb = 0
+            swap_total_kb = 0
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem_total_kb = int(line.split()[1])
+                    elif line.startswith("SwapTotal:"):
+                        swap_total_kb = int(line.split()[1])
+            total_gb = (mem_total_kb + swap_total_kb) / 1e6
+            if total_gb >= 24.0:
+                sys.__stdout__.write(f"💾 RAM+Swap: {total_gb:.1f} GB — sufficient, skipping swap setup\n")
+                return
+            if os.path.exists(_SWAP_PATH):
+                sys.__stdout__.write(f"💾 Swap file already exists\n")
+                return
+            # Check disk space
+            st = os.statvfs("/content")
+            disk_free_gb = (st.f_bavail * st.f_frsize) / 1e9
+            if disk_free_gb < _SWAP_SIZE_GB + 5:
+                sys.__stdout__.write(f"💾 Not enough disk ({disk_free_gb:.1f} GB free), skipping swap\n")
+                return
+            sys.__stdout__.write(f"💾 Creating {_SWAP_SIZE_GB} GB swap file (needed for download + model loading)...\n")
+            sys.__stdout__.flush()
+            ret = os.system(f"fallocate -l {_SWAP_SIZE_GB}G {_SWAP_PATH} 2>/dev/null")
+            if ret != 0:
+                os.system(f"dd if=/dev/zero of={_SWAP_PATH} bs=1M count={_SWAP_SIZE_GB * 1024} status=none 2>/dev/null")
+            os.system(f"chmod 600 {_SWAP_PATH}")
+            os.system(f"mkswap {_SWAP_PATH} >/dev/null 2>&1")
+            os.system(f"swapon {_SWAP_PATH} 2>/dev/null")
+            # Verify
+            new_swap_kb = 0
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("SwapTotal:"):
+                        new_swap_kb = int(line.split()[1])
+            sys.__stdout__.write(f"   ✅ Swap active: {new_swap_kb / 1e6:.1f} GB\n")
+        except Exception as e:
+            sys.__stdout__.write(f"   ⚠ Early swap setup failed (non-fatal): {e}\n")
+
+    _early_swap_setup()
+
     if not os.path.exists("/content/drive/MyDrive"):
         from google.colab import drive
         drive.mount("/content/drive", force_remount=False)
@@ -193,51 +246,107 @@ def run_gui():
     GPU_NAME = torch.cuda.get_device_name(0)
     TOTAL_VRAM = torch.cuda.get_device_properties(0).total_memory / 1e9
 
-    # Max faces for render — above this the nvdiffrec renderer can trigger
-    # illegal memory access which poisons the entire CUDA context.
-    RENDER_MAX_FACES = 16_000_000
+    # ══════════════════════════════════════════════════════════════
+    # GPU PROFILE — automatically tunes every parameter to the hardware
+    # ══════════════════════════════════════════════════════════════
+    #
+    #   T4  (15 GB, free Colab)  → conservative: fewer steps, lower res,
+    #                               smaller textures, swap file needed
+    #   L4  (24 GB, Colab Pro)   → balanced: full steps, good textures
+    #   A100 (40/80 GB)          → full quality: max steps, 4K textures,
+    #                               high-res renders, no swap needed
+    #
+    # The profile is a dict so every downstream consumer can just read
+    # GPU_PROFILE["key"] instead of scattered if/else blocks.
+
+    def _detect_gpu_profile():
+        name_lower = GPU_NAME.lower()
+        vram = TOTAL_VRAM
+
+        # ── Identify the GPU tier ──
+        if "a100" in name_lower or "h100" in name_lower or vram >= 38:
+            tier = "high"
+        elif "l4" in name_lower or "a10" in name_lower or "l40" in name_lower or (22 <= vram < 38):
+            tier = "mid"
+        else:
+            # T4, V100-16GB, or anything with <22 GB
+            tier = "low"
+
+        profiles = {
+            # ── HIGH: A100 / H100 (40–80 GB) ─────────────────────
+            "high": {
+                "tier":               "high",
+                "label":              f"🟢 {GPU_NAME} ({vram:.0f} GB) — full quality",
+                # Sampler steps (more = higher quality, slower)
+                "ss_steps":           20,    # sparse structure
+                "shape_steps":        20,    # shape SLAT
+                "tex_steps":          20,    # texture SLAT
+                # Default texture & mesh settings
+                "texture_size":       4096,
+                "decimate_target":    1_000_000,
+                # Render settings
+                "video_resolution":   1024,
+                "render_max_faces":   16_000_000,
+                # Swap
+                "swap_gb":            0,     # not needed
+                # Loading strategy
+                "incremental_load":   False, # .cuda() in one shot is fine
+            },
+            # ── MID: L4 / A10 / L40S (24 GB) ─────────────────────
+            "mid": {
+                "tier":               "mid",
+                "label":              f"🟡 {GPU_NAME} ({vram:.0f} GB) — balanced",
+                "ss_steps":           16,
+                "shape_steps":        16,
+                "tex_steps":          16,
+                "texture_size":       4096,
+                "decimate_target":    1_000_000,
+                "video_resolution":   768,
+                "render_max_faces":   16_000_000,
+                "swap_gb":            0,
+                "incremental_load":   False,
+            },
+            # ── LOW: T4 / V100-16GB (≤16 GB) ─────────────────────
+            "low": {
+                "tier":               "low",
+                "label":              f"🔴 {GPU_NAME} ({vram:.0f} GB) — memory-optimised",
+                "ss_steps":           12,
+                "shape_steps":        12,
+                "tex_steps":          12,
+                "texture_size":       2048,  # 4096 can OOM on bake
+                "decimate_target":    500_000,
+                "video_resolution":   512,
+                "render_max_faces":   8_000_000,  # safer for T4
+                "swap_gb":            8,
+                "incremental_load":   True,  # sub-model-at-a-time
+            },
+        }
+        return profiles[tier]
+
+    GPU_PROFILE = _detect_gpu_profile()
+    print(f"GPU: {GPU_PROFILE['label']}")
+
+    # Apply profile to globals
+    RENDER_MAX_FACES = GPU_PROFILE["render_max_faces"]
 
     # ── Swap file: use SSD as overflow RAM during model loading ──────
     # Colab T4 free tier has ~12.7 GB RAM but from_pretrained needs ~8 GB
     # just for deserialization. A swap file on the local SSD acts as
     # temporary overflow so the OOM killer doesn't strike.
-    SWAP_PATH = "/content/_trellis_swap"
-    SWAP_SIZE_GB = 8
+    SWAP_PATH = _SWAP_PATH  # reuse from early setup
+    SWAP_SIZE_GB = _SWAP_SIZE_GB
 
-    def _setup_swap():
-        """Create a swap file if total available memory (RAM + existing swap) is tight."""
+    # Swap was already set up at the very start of run_gui() (before imports).
+    # The GPU_PROFILE["swap_gb"] just tells us whether this GPU tier needs it;
+    # the early setup always creates it on low-RAM systems regardless of tier.
+    if GPU_PROFILE["swap_gb"] == 0 and os.path.exists(SWAP_PATH):
+        # High/mid tier GPU with plenty of RAM — remove swap to free disk
         try:
-            vm = psutil.virtual_memory()
-            sm = psutil.swap_memory()
-            total_available = (vm.total + sm.total) / 1e9
-            # Only add swap if we have less than 20 GB total (RAM + swap)
-            if total_available >= 20.0:
-                print(f"💾 Swap: {sm.total / 1e9:.1f} GB existing + {vm.total / 1e9:.1f} GB RAM = {total_available:.1f} GB total — sufficient")
-                return
-            if os.path.exists(SWAP_PATH):
-                print(f"💾 Swap file already exists at {SWAP_PATH}")
-                return
-            # Check available disk space
-            disk = shutil.disk_usage("/content")
-            if disk.free / 1e9 < SWAP_SIZE_GB + 5:  # keep 5 GB headroom
-                print(f"💾 Swap: not enough disk space ({disk.free / 1e9:.1f} GB free), skipping")
-                return
-            print(f"💾 Creating {SWAP_SIZE_GB} GB swap file (SSD → temporary overflow RAM)...")
-            sys.__stdout__.flush()
-            # fallocate is instant (no disk write), much faster than dd
-            ret = os.system(f"fallocate -l {SWAP_SIZE_GB}G {SWAP_PATH} 2>/dev/null")
-            if ret != 0:
-                # Fallback: dd (slower but always works)
-                os.system(f"dd if=/dev/zero of={SWAP_PATH} bs=1M count={SWAP_SIZE_GB * 1024} status=none 2>/dev/null")
-            os.system(f"chmod 600 {SWAP_PATH}")
-            os.system(f"mkswap {SWAP_PATH} >/dev/null 2>&1")
-            os.system(f"swapon {SWAP_PATH} 2>/dev/null")
-            sm_after = psutil.swap_memory()
-            print(f"   ✅ Swap active: {sm_after.total / 1e9:.1f} GB total swap")
-        except Exception as e:
-            print(f"   ⚠ Swap setup failed (non-fatal): {e}")
-
-    _setup_swap()
+            os.system(f"swapoff {SWAP_PATH} 2>/dev/null")
+            os.remove(SWAP_PATH)
+            print(f"💾 Swap not needed for {GPU_PROFILE['tier']} tier — removed, {SWAP_SIZE_GB} GB disk freed")
+        except:
+            pass
 
     print(f"GPU: {GPU_NAME} | VRAM: {TOTAL_VRAM:.1f} GB")
 
@@ -278,81 +387,85 @@ def run_gui():
     _ram1, _ram_tot, _ = _mem_report()
     print(f"   Done in {_t1 - _t0:.0f}s | RAM: {_ram1:.1f} / {_ram_tot:.1f} GB (+{_ram1 - _ram0:.1f} GB)")
 
-    # ── Phase 2: Move models to GPU one-by-one ──
-    # Instead of trellis_pipe.cuda() which briefly doubles RAM usage,
-    # we move each sub-model individually and free the CPU copy immediately.
-    # This keeps peak RAM ≈ largest single sub-model instead of entire pipeline.
-    print(f"🔄 Moving models to GPU (low-memory: one sub-model at a time)...")
-    sys.__stdout__.flush()
+    # ── Phase 2: Move models to GPU ──
+    if GPU_PROFILE["incremental_load"]:
+        # LOW-MEMORY PATH: move each sub-model individually, free CPU copies
+        # between transfers. Peak RAM ≈ largest single sub-model.
+        print(f"🔄 Moving models to GPU (low-memory: one sub-model at a time)...")
+        sys.__stdout__.flush()
 
-    _moved_count = 0
-    _moved_names = []
+        _moved_count = 0
+        _moved_names = []
 
-    # Collect all nn.Module attributes on the pipeline
-    _all_submodules = {}
+        # Collect all nn.Module attributes on the pipeline
+        _all_submodules = {}
 
-    # 1. Named models dict (the main ones)
-    if hasattr(trellis_pipe, 'models') and isinstance(trellis_pipe.models, dict):
-        for name, model in trellis_pipe.models.items():
-            _all_submodules[f"models.{name}"] = model
+        # 1. Named models dict (the main ones)
+        if hasattr(trellis_pipe, 'models') and isinstance(trellis_pipe.models, dict):
+            for name, model in trellis_pipe.models.items():
+                _all_submodules[f"models.{name}"] = model
 
-    # 2. image_cond_model (usually DINOv2 or similar)
-    if hasattr(trellis_pipe, 'image_cond_model'):
-        _all_submodules["image_cond_model"] = trellis_pipe.image_cond_model
+        # 2. image_cond_model (usually DINOv2 or similar)
+        if hasattr(trellis_pipe, 'image_cond_model'):
+            _all_submodules["image_cond_model"] = trellis_pipe.image_cond_model
 
-    # 3. Any other nn.Module attributes we missed
-    for attr_name in dir(trellis_pipe):
-        if attr_name.startswith('_'):
-            continue
+        # 3. Any other nn.Module attributes we missed
+        for attr_name in dir(trellis_pipe):
+            if attr_name.startswith('_'):
+                continue
+            try:
+                attr = getattr(trellis_pipe, attr_name)
+                if isinstance(attr, torch.nn.Module) and attr_name not in _all_submodules:
+                    if any(True for _ in attr.parameters()):
+                        _all_submodules[attr_name] = attr
+            except:
+                pass
+
+        for _name, _module in _all_submodules.items():
+            _on_cuda = False
+            try:
+                _on_cuda = next(_module.parameters()).is_cuda
+            except StopIteration:
+                continue
+            except:
+                pass
+
+            if not _on_cuda:
+                _param_bytes = sum(p.numel() * p.element_size() for p in _module.parameters())
+                _param_gb = _param_bytes / 1e9
+                sys.__stdout__.write(f"   → {_name} ({_param_gb:.2f} GB)...")
+                sys.__stdout__.flush()
+
+                _module.to("cuda")
+                gc.collect()
+
+                _moved_count += 1
+                _moved_names.append(_name)
+                _ram_now, _, _vram_now = _mem_report()
+                sys.__stdout__.write(f" ✓  RAM: {_ram_now:.1f} GB | VRAM: {_vram_now:.1f} GB\n")
+                sys.__stdout__.flush()
+
+        torch.cuda.synchronize()
+        _drop_caches()
+        _t2 = time.time()
+        _ram2, _, _vram2 = _mem_report()
+        print(f"   Moved {_moved_count} sub-models in {_t2 - _t1:.0f}s | RAM: {_ram2:.1f} GB | VRAM: {_vram2:.1f} / {TOTAL_VRAM:.1f} GB")
+
+        # Safety: ensure anything missed also gets moved
         try:
-            attr = getattr(trellis_pipe, attr_name)
-            if isinstance(attr, torch.nn.Module) and attr_name not in _all_submodules:
-                # Check it actually has parameters
-                if any(True for _ in attr.parameters()):
-                    _all_submodules[attr_name] = attr
-        except:
-            pass
-
-    for _name, _module in _all_submodules.items():
-        # Check if already on CUDA
-        _on_cuda = False
-        try:
-            _on_cuda = next(_module.parameters()).is_cuda
-        except StopIteration:
-            continue  # no parameters
-        except:
-            pass
-
-        if not _on_cuda:
-            _param_bytes = sum(p.numel() * p.element_size() for p in _module.parameters())
-            _param_gb = _param_bytes / 1e9
-            sys.__stdout__.write(f"   → {_name} ({_param_gb:.2f} GB)...")
-            sys.__stdout__.flush()
-
-            _module.to("cuda")
-
-            # Force Python to release the CPU tensor storage
-            gc.collect()
-
-            _moved_count += 1
-            _moved_names.append(_name)
-            _ram_now, _, _vram_now = _mem_report()
-            sys.__stdout__.write(f" ✓  RAM: {_ram_now:.1f} GB | VRAM: {_vram_now:.1f} GB\n")
-            sys.__stdout__.flush()
-
-    # Final sync + cleanup
-    torch.cuda.synchronize()
-    _drop_caches()
-    _t2 = time.time()
-    _ram2, _, _vram2 = _mem_report()
-    print(f"   Moved {_moved_count} sub-models in {_t2 - _t1:.0f}s | RAM: {_ram2:.1f} GB | VRAM: {_vram2:.1f} / {TOTAL_VRAM:.1f} GB")
-
-    # Safety: ensure anything missed also gets moved
-    # (this is a no-op if everything was already moved above)
-    try:
+            trellis_pipe.cuda()
+        except Exception as _e:
+            sys.__stdout__.write(f"   ⚠ Final .cuda() pass: {_e}\n")
+    else:
+        # FAST PATH: plenty of RAM, just move everything in one shot
+        _vram_before = torch.cuda.memory_allocated() / 1e9
+        print("🔄 Moving model to GPU...")
+        sys.__stdout__.flush()
         trellis_pipe.cuda()
-    except Exception as _e:
-        sys.__stdout__.write(f"   ⚠ Final .cuda() pass: {_e}\n")
+        torch.cuda.synchronize()
+        _t2 = time.time()
+        _vram2 = torch.cuda.memory_allocated() / 1e9
+        print(f"   Done in {_t2 - _t1:.0f}s | VRAM: {_vram2:.1f} / {TOTAL_VRAM:.1f} GB")
 
     _drop_caches()
 
@@ -875,9 +988,9 @@ def run_gui():
                         set_phase(1)
                         out = trellis_pipe.run(
                             [image], image_weights=[1.0],
-                            sparse_structure_sampler_params={"steps": 12},
-                            shape_slat_sampler_params={"steps": 12},
-                            tex_slat_sampler_params={"steps": 12},
+                            sparse_structure_sampler_params={"steps": GPU_PROFILE["ss_steps"]},
+                            shape_slat_sampler_params={"steps": GPU_PROFILE["shape_steps"]},
+                            tex_slat_sampler_params={"steps": GPU_PROFILE["tex_steps"]},
                         )
                         if not out:
                             raise RuntimeError("Empty pipeline result")
@@ -927,6 +1040,7 @@ def run_gui():
                             media_path, media_type = do_render(
                                 mesh, render_mode, out_path, base,
                                 fps=s["fps"],
+                                resolution=s.get("video_resolution", GPU_PROFILE["video_resolution"]),
                                 sprite_directions=s.get("sprite_directions", 16),
                                 sprite_size=s.get("sprite_size", 256),
                                 sprite_pitch=s.get("sprite_pitch", 0.52),
@@ -1115,7 +1229,18 @@ def run_gui():
 
     @app.route("/api/keepalive")
     def api_keepalive():
-        return jsonify({"ok": True})
+        return jsonify({
+            "ok": True,
+            "gpu": GPU_NAME,
+            "vram_gb": round(TOTAL_VRAM, 1),
+            "tier": GPU_PROFILE["tier"],
+        })
+
+    @app.route("/api/gpu_profile")
+    def api_gpu_profile():
+        return jsonify({
+            k: v for k, v in GPU_PROFILE.items()
+        })
 
     # ── HTML PAGE ──
 
@@ -1357,7 +1482,7 @@ def run_gui():
     function poll(jobId,type,cfg){if(timers[type])clearInterval(timers[type]);if(!localStart[type])localStart[type]=Date.now();timers[type]=setInterval(async()=>{try{const r=await fetch('/api/status/'+jobId);const d=await r.json();const p=d.progress||{};const elapsed=p.elapsed||((Date.now()-localStart[type])/1000);$(cfg.timer).textContent=fmtTime(elapsed);const pct=p.pct||0;$(cfg.fill).style.width=pct+'%';$(cfg.pct).textContent=Math.round(pct)+'%';$(cfg.phase).textContent=p.phase||'';if(cfg.image&&p.image_num&&p.total)$(cfg.image).textContent='Image '+p.image_num+' of '+p.total+(p.name?' — '+p.name:'');if(d.status==='done')$(cfg.status).innerHTML='<span class="done-icon">✅</span> Complete';else $(cfg.status).innerHTML='<span class="spinner"></span> '+cfg.statusText;if(d.log){const b=$(cfg.log);b.textContent=d.log.join('\n');b.scrollTop=b.scrollHeight}if(cfg.console){const cr=await fetch('/api/console');const cd=await cr.json();const cel=$(cfg.console);cel.textContent=cd.lines.join('\n');cel.scrollTop=cel.scrollHeight}if(d.status==='done'){clearInterval(timers[type]);timers[type]=null;delete localStart[type];if(cfg.btn){cfg.btn.disabled=false;cfg.btn.textContent=cfg.btnText}cfg.renderFn(d.results||[])}}catch(e){console.error(e)}},800)}
 
     /* ── Generate ── */
-    async function startGen(){if(!files3d.length)return;const btn=$('genBtn3d');btn.disabled=true;btn.textContent='Uploading images...';const fd=new FormData();files3d.forEach(f=>fd.append('images',f));fd.append('settings',JSON.stringify({output_dir:$('sOutDir').value,fps:parseInt($('sFps').value),texture_size:parseInt($('sTexture').value),decimate_target:parseInt($('sDecimate').value),remesh:$('sRemesh').checked,remesh_band:parseFloat($('sRemeshBand').value),render_mode:selectedRenderMode,video_resolution:512,sprite_directions:parseInt($('sSpriteDirections').value),sprite_size:parseInt($('sSpriteSize').value),sprite_pitch:parseFloat($('sSpritePitch').value),doom_directions:parseInt($('sDoomDirections').value),doom_size:parseInt($('sDoomSize').value),doom_pitch:parseFloat($('sDoomPitch').value)}));try{const r=await fetch('/api/generate',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Generating...';show('progressPanel3d');show('logBox3d');$('logBox3d').textContent='';hide('results3d');$('resultsList3d').innerHTML='';$('pFill3d').style.width='0%';$('pPct3d').textContent='0%';localStart['generate']=Date.now();poll(d.job_id,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:btn,btnText:'Generate 3D models →',renderFn:render3d})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate 3D models →'}}
+    async function startGen(){if(!files3d.length)return;const btn=$('genBtn3d');btn.disabled=true;btn.textContent='Uploading images...';const fd=new FormData();files3d.forEach(f=>fd.append('images',f));fd.append('settings',JSON.stringify({output_dir:$('sOutDir').value,fps:parseInt($('sFps').value),texture_size:parseInt($('sTexture').value),decimate_target:parseInt($('sDecimate').value),remesh:$('sRemesh').checked,remesh_band:parseFloat($('sRemeshBand').value),render_mode:selectedRenderMode,sprite_directions:parseInt($('sSpriteDirections').value),sprite_size:parseInt($('sSpriteSize').value),sprite_pitch:parseFloat($('sSpritePitch').value),doom_directions:parseInt($('sDoomDirections').value),doom_size:parseInt($('sDoomSize').value),doom_pitch:parseFloat($('sDoomPitch').value)}));try{const r=await fetch('/api/generate',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Generating...';show('progressPanel3d');show('logBox3d');$('logBox3d').textContent='';hide('results3d');$('resultsList3d').innerHTML='';$('pFill3d').style.width='0%';$('pPct3d').textContent='0%';localStart['generate']=Date.now();poll(d.job_id,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:btn,btnText:'Generate 3D models →',renderFn:render3d})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate 3D models →'}}
 
     /* ── Render results — handles all media types including RTS and Doom sprites ── */
     function render3d(results){if(!results.length)return;show('results3d');const l=$('resultsList3d');l.innerHTML='';results.forEach(r=>{const c=document.createElement('div');c.className='result-card';let mediaHtml='';
@@ -1404,6 +1529,29 @@ def run_gui():
     /* ── Reconnect ── */
     async function tryReconnect(){try{const r=await fetch('/api/active');const d=await r.json();if(d.generate){show('progressPanel3d');show('logBox3d');$('genBtn3d').disabled=true;$('genBtn3d').textContent='Generating...';localStart['generate']=Date.now();poll(d.generate,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:$('genBtn3d'),btnText:'Generate 3D models →',renderFn:render3d})}if(d.rmbg){switchTab('rmbg',document.querySelector('[data-tab=rmbg]'));show('progressPanelRmbg');show('logBoxRmbg');$('genBtnRmbg').disabled=true;$('genBtnRmbg').textContent='Processing...';localStart['rmbg']=Date.now();poll(d.rmbg,'rmbg',{timer:'pTimerRmbg',fill:'pFillRmbg',pct:'pPctRmbg',phase:'pPhaseRmbg',status:'pStatusRmbg',statusText:'Processing...',image:null,log:'logBoxRmbg',console:null,btn:$('genBtnRmbg'),btnText:'Remove backgrounds →',renderFn:renderRmbg})}}catch(e){}}
     tryReconnect();
+
+    /* ── Load GPU profile and set UI defaults ── */
+    (async function loadGpuProfile(){
+      try{
+        const r=await fetch('/api/gpu_profile');
+        const p=await r.json();
+        /* Set texture size dropdown */
+        const tex=$('sTexture');
+        if(tex&&p.texture_size){
+          for(let o of tex.options){o.selected=(parseInt(o.value)===p.texture_size)}
+        }
+        /* Set decimate target */
+        const dec=$('sDecimate');
+        if(dec&&p.decimate_target){dec.value=p.decimate_target}
+        /* Show GPU tier badge */
+        const badge=document.getElementById('keepaliveBadge');
+        if(badge){
+          const tierEmoji={high:'🟢',mid:'🟡',low:'🔴'};
+          badge.title=p.label||('GPU tier: '+p.tier);
+          badge.textContent=(tierEmoji[p.tier]||'●')+' '+p.tier.toUpperCase();
+        }
+      }catch(e){console.log('gpu_profile fetch failed:',e)}
+    })();
     </script>
     </body>
     </html>"""
@@ -1419,9 +1567,10 @@ def run_gui():
             return jsonify({"error": "No images"}), 400
         settings = json.loads(request.form.get("settings", "{}"))
         for k, v in [("output_dir", "/content/drive/MyDrive/trellis_models_out"),
-                     ("fps", 15), ("texture_size", 4096), ("decimate_target", 1000000),
+                     ("fps", 15), ("texture_size", GPU_PROFILE["texture_size"]),
+                     ("decimate_target", GPU_PROFILE["decimate_target"]),
                      ("remesh", True), ("remesh_band", 1.0), ("render_mode", "video"),
-                     ("video_resolution", 512),
+                     ("video_resolution", GPU_PROFILE["video_resolution"]),
                      ("sprite_directions", 16), ("sprite_size", 256), ("sprite_pitch", 0.52),
                      ("doom_directions", 8), ("doom_size", 256), ("doom_pitch", 0.0)]:
             settings.setdefault(k, v)
