@@ -184,8 +184,70 @@ def run_gui():
                 copy_weights(DRIVE_WEIGHTS, LOCAL_WEIGHTS, label="Drive → local"); return str(LOCAL_WEIGHTS)
             except Exception as e:
                 print(f"  ⚠ Copy failed ({e}), downloading from HuggingFace.")
-        print(f"⬇ Downloading weights from {HF_MODEL_ID}...");
-        return HF_MODEL_ID
+
+        # ── Low-memory download: stream files one-at-a-time to disk ──
+        # HuggingFace's default snapshot_download uses multiple workers and
+        # buffers aggressively, spiking RAM well past the file sizes.
+        # We download each file individually with a small buffer instead.
+        print(f"⬇ Downloading weights from {HF_MODEL_ID} (low-memory mode)...")
+        sys.__stdout__.flush()
+
+        try:
+            from huggingface_hub import HfApi, hf_hub_download
+            api = HfApi()
+            repo_files = api.list_repo_files(HF_MODEL_ID)
+            LOCAL_WEIGHTS.mkdir(parents=True, exist_ok=True)
+
+            total_files = len(repo_files)
+            for i, fname in enumerate(repo_files, 1):
+                dest = LOCAL_WEIGHTS / fname
+                if dest.exists() and dest.stat().st_size > 0:
+                    sys.__stdout__.write(f"\r  [{i}/{total_files}] {fname} — already exists, skipping")
+                    sys.__stdout__.flush()
+                    continue
+
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                sys.__stdout__.write(f"\r  [{i}/{total_files}] {fname}...")
+                sys.__stdout__.flush()
+
+                # hf_hub_download streams to disk with small buffer;
+                # force_download=False lets it resume; local_dir writes
+                # directly to our target path instead of HF cache.
+                try:
+                    hf_hub_download(
+                        repo_id=HF_MODEL_ID,
+                        filename=fname,
+                        local_dir=str(LOCAL_WEIGHTS),
+                        local_dir_use_symlinks=False,
+                        force_download=False,
+                    )
+                except Exception as dl_err:
+                    sys.__stdout__.write(f" ⚠ {dl_err}\n")
+                    # Retry once
+                    try:
+                        gc.collect()
+                        hf_hub_download(
+                            repo_id=HF_MODEL_ID,
+                            filename=fname,
+                            local_dir=str(LOCAL_WEIGHTS),
+                            local_dir_use_symlinks=False,
+                            force_download=True,
+                        )
+                    except Exception as dl_err2:
+                        sys.__stdout__.write(f" ❌ retry failed: {dl_err2}\n")
+                        raise
+
+                # Free any buffers between files
+                gc.collect()
+
+            sys.__stdout__.write(f"\n  ✅ All {total_files} files downloaded to {LOCAL_WEIGHTS}\n")
+            sys.__stdout__.flush()
+            return str(LOCAL_WEIGHTS)
+        except Exception as e:
+            print(f"  ⚠ Low-memory download failed: {e}")
+            print(f"  Falling back to standard HuggingFace download...")
+            # Last resort: let from_pretrained handle it (may OOM)
+            return HF_MODEL_ID
 
     def cache_weights_to_drive():
         if DRIVE_WEIGHTS.exists() and any(DRIVE_WEIGHTS.iterdir()): return
@@ -374,7 +436,6 @@ def run_gui():
     print(f"System RAM: {_ram_used:.1f} / {_ram_total:.1f} GB used")
     print("Loading TRELLIS.2 pipeline...")
     weights_path = resolve_weights()
-    downloaded_from_hf = (weights_path == HF_MODEL_ID)
 
     # ── Phase 1: Deserialize model (CPU) ──
     _drop_caches()
@@ -469,17 +530,11 @@ def run_gui():
 
     _drop_caches()
 
-    if downloaded_from_hf:
-        try:
-            from huggingface_hub import snapshot_download
-            hf_cache_path = snapshot_download(HF_MODEL_ID, local_files_only=True)
-            if not LOCAL_WEIGHTS.exists():
-                print(f"\n📁 Caching weights to {LOCAL_WEIGHTS} (speeds up next launch)...")
-                copy_weights(hf_cache_path, LOCAL_WEIGHTS, label="HF cache → local")
-        except Exception as e:
-            print(f"  ⚠ Could not copy HF cache: {e}")
-        print("💾 Saving weights to Google Drive in background...")
-        threading.Thread(target=cache_weights_to_drive, daemon=True).start()
+    # ── Cache weights to Google Drive for faster next launch ──
+    if not DRIVE_WEIGHTS.exists() or not any(DRIVE_WEIGHTS.iterdir()):
+        if LOCAL_WEIGHTS.exists() and any(LOCAL_WEIGHTS.iterdir()):
+            print("💾 Saving weights to Google Drive in background...")
+            threading.Thread(target=cache_weights_to_drive, daemon=True).start()
 
     print("🌄 Loading HDRI environment map...")
     sys.__stdout__.flush()
