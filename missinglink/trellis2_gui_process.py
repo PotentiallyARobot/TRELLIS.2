@@ -360,6 +360,14 @@ def run_gui():
                 continue
 
             done = False
+
+            # ── Detect if v is a cross-repo HF reference ──
+            # e.g. "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"
+            # These point to a DIFFERENT HuggingFace repo, not our local weights.
+            _v_parts = v.split("/")
+            _is_cross_repo = (len(_v_parts) >= 3 and not v.startswith("ckpts"))
+
+            # ── Try 1: load from local files ──
             local_path = f"{path}/{v}"
             json_exists = _os.path.exists(f"{local_path}.json")
             safetensors_exists = _os.path.exists(f"{local_path}.safetensors")
@@ -368,7 +376,6 @@ def run_gui():
                 and _os.path.getsize(f"{local_path}.safetensors") > 1024
             )
 
-            # ── Try 1: load from local files ──
             if json_exists and safetensors_valid:
                 try:
                     _sz = _os.path.getsize(f"{local_path}.safetensors") / 1e9
@@ -380,37 +387,39 @@ def run_gui():
                 except Exception as e:
                     sys.__stdout__.write(f" ⚠ {e}\n")
 
-            # ── Try 2: download just this model's files from HF ──
+            # ── Try 2: cross-repo reference → let models.__init__ handle it ──
+            if not done and _is_cross_repo:
+                try:
+                    sys.__stdout__.write(f"  [{i}/{total}] {k} (cross-repo: {v})...")
+                    sys.__stdout__.flush()
+                    _loaded[k] = _models_mod.from_pretrained(v)
+                    sys.__stdout__.write(" ✓\n")
+                    done = True
+                except Exception as e:
+                    sys.__stdout__.write(f" ⚠ cross-repo failed: {e}\n")
+
+            # ── Try 3: download from primary HF repo ──
             if not done:
                 from huggingface_hub import hf_hub_download as _hf_dl
-                # Figure out the HF repo ID — either from env or from path
                 _repo_id = _os.environ.get("TRELLIS2_HF_REPO", HF_MODEL_ID)
+                _dl_dir = path if _path_is_local_dir else str(LOCAL_WEIGHTS)
 
-                sys.__stdout__.write(f"  [{i}/{total}] {k} (downloading {v}.json + .safetensors)...")
+                sys.__stdout__.write(f"  [{i}/{total}] {k} (HF download: {_repo_id}/{v})...")
                 sys.__stdout__.flush()
                 try:
-                    # Download config + weights for this one model
-                    _dl_json = _hf_dl(
+                    _hf_dl(
                         repo_id=_repo_id, filename=f"{v}.json",
-                        local_dir=path if _path_is_local_dir else str(LOCAL_WEIGHTS),
-                        local_dir_use_symlinks=False,
+                        local_dir=_dl_dir, local_dir_use_symlinks=False,
                     )
-                    _dl_safe = _hf_dl(
+                    _hf_dl(
                         repo_id=_repo_id, filename=f"{v}.safetensors",
-                        local_dir=path if _path_is_local_dir else str(LOCAL_WEIGHTS),
-                        local_dir_use_symlinks=False,
+                        local_dir=_dl_dir, local_dir_use_symlinks=False,
                     )
                     gc.collect()
 
-                    # Now load from whichever path the files landed at
-                    _load_path = local_path
-                    if not _os.path.exists(f"{_load_path}.json"):
-                        # hf_hub_download might have put them in LOCAL_WEIGHTS
-                        _load_path = f"{LOCAL_WEIGHTS}/{v}"
-
+                    _load_path = f"{_dl_dir}/{v}"
                     _loaded[k] = _models_mod.from_pretrained(_load_path)
                     sys.__stdout__.write(" ✓\n")
-                    done = True
                 except Exception as e:
                     sys.__stdout__.write(f" ❌ {e}\n")
                     raise
