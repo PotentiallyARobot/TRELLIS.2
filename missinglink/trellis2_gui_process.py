@@ -197,6 +197,48 @@ def run_gui():
     # illegal memory access which poisons the entire CUDA context.
     RENDER_MAX_FACES = 16_000_000
 
+    # ── Swap file: use SSD as overflow RAM during model loading ──────
+    # Colab T4 free tier has ~12.7 GB RAM but from_pretrained needs ~8 GB
+    # just for deserialization. A swap file on the local SSD acts as
+    # temporary overflow so the OOM killer doesn't strike.
+    SWAP_PATH = "/content/_trellis_swap"
+    SWAP_SIZE_GB = 8
+
+    def _setup_swap():
+        """Create a swap file if total available memory (RAM + existing swap) is tight."""
+        try:
+            vm = psutil.virtual_memory()
+            sm = psutil.swap_memory()
+            total_available = (vm.total + sm.total) / 1e9
+            # Only add swap if we have less than 20 GB total (RAM + swap)
+            if total_available >= 20.0:
+                print(f"💾 Swap: {sm.total / 1e9:.1f} GB existing + {vm.total / 1e9:.1f} GB RAM = {total_available:.1f} GB total — sufficient")
+                return
+            if os.path.exists(SWAP_PATH):
+                print(f"💾 Swap file already exists at {SWAP_PATH}")
+                return
+            # Check available disk space
+            disk = shutil.disk_usage("/content")
+            if disk.free / 1e9 < SWAP_SIZE_GB + 5:  # keep 5 GB headroom
+                print(f"💾 Swap: not enough disk space ({disk.free / 1e9:.1f} GB free), skipping")
+                return
+            print(f"💾 Creating {SWAP_SIZE_GB} GB swap file (SSD → temporary overflow RAM)...")
+            sys.__stdout__.flush()
+            # fallocate is instant (no disk write), much faster than dd
+            ret = os.system(f"fallocate -l {SWAP_SIZE_GB}G {SWAP_PATH} 2>/dev/null")
+            if ret != 0:
+                # Fallback: dd (slower but always works)
+                os.system(f"dd if=/dev/zero of={SWAP_PATH} bs=1M count={SWAP_SIZE_GB * 1024} status=none 2>/dev/null")
+            os.system(f"chmod 600 {SWAP_PATH}")
+            os.system(f"mkswap {SWAP_PATH} >/dev/null 2>&1")
+            os.system(f"swapon {SWAP_PATH} 2>/dev/null")
+            sm_after = psutil.swap_memory()
+            print(f"   ✅ Swap active: {sm_after.total / 1e9:.1f} GB total swap")
+        except Exception as e:
+            print(f"   ⚠ Swap setup failed (non-fatal): {e}")
+
+    _setup_swap()
+
     print(f"GPU: {GPU_NAME} | VRAM: {TOTAL_VRAM:.1f} GB")
 
     # ── Memory info helper ──
@@ -341,6 +383,15 @@ def run_gui():
         f"   RAM: {_ram_final:.1f} / {_ram_total_final:.1f} GB | "
         f"VRAM: {_vram_final:.1f} / {TOTAL_VRAM:.1f} GB"
     )
+
+    # ── Remove swap file: models are on GPU, no longer needed ──
+    if os.path.exists(SWAP_PATH):
+        try:
+            os.system(f"swapoff {SWAP_PATH} 2>/dev/null")
+            os.remove(SWAP_PATH)
+            print(f"💾 Swap file removed — {SWAP_SIZE_GB} GB disk freed")
+        except:
+            pass
 
     # ── CUDA safety helpers ──
     def cuda_ok():
