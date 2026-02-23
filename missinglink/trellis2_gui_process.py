@@ -359,8 +359,14 @@ def run_gui():
 
             done = False
             # Try local path first (our pre-downloaded files)
+            # models.from_pretrained expects a path where {path}.json and
+            # {path}.safetensors exist — NOT a directory
             local_path = f"{path}/{v}"
-            if _os.path.exists(local_path):
+            has_local_files = (
+                _os.path.exists(f"{local_path}.json")
+                and _os.path.exists(f"{local_path}.safetensors")
+            )
+            if has_local_files:
                 try:
                     sys.__stdout__.write(f"  [{i}/{total}] {k} (local)...")
                     sys.__stdout__.flush()
@@ -370,12 +376,16 @@ def run_gui():
                 except Exception as e:
                     sys.__stdout__.write(f" ⚠ {e}\n")
 
-            # Fallback: let models.from_pretrained resolve it (may use HF)
+            # Fallback: try the full HF-style path (repo/subpath)
             if not done:
                 try:
-                    sys.__stdout__.write(f"  [{i}/{total}] {k} (HF: {v})...")
+                    # Use f"{path}/{v}" so models.__init__ gets the full
+                    # "microsoft/TRELLIS.2-4B/ckpts/model_name" string
+                    # which it can parse into repo_id + model_name
+                    full_hf_path = f"{path}/{v}" if "/" in path else v
+                    sys.__stdout__.write(f"  [{i}/{total}] {k} (HF: {full_hf_path})...")
                     sys.__stdout__.flush()
-                    _loaded[k] = _models_mod.from_pretrained(v)
+                    _loaded[k] = _models_mod.from_pretrained(full_hf_path)
                     sys.__stdout__.write(" ✓\n")
                 except Exception as e:
                     sys.__stdout__.write(f" ❌ {e}\n")
