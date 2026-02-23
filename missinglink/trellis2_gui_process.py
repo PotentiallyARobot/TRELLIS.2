@@ -1371,63 +1371,130 @@ def run_gui():
         return send_file(real)
 
     # ══════════════════════════════════════════════════════════════
-    # LAUNCH
+    # LAUNCH  (robust — health-checked, proxy-verified, must-not-fail)
     # ══════════════════════════════════════════════════════════════
+    import socket as _socket
+    import requests as _requests
+
+    def _find_free_port(preferred=5000):
+        """Return *preferred* if available, otherwise an OS-assigned free port."""
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", preferred))
+                return preferred
+            except OSError:
+                s.bind(("0.0.0.0", 0))
+                return s.getsockname()[1]
+
+    PORT = _find_free_port(5000)
+
+    # Capture server-thread exceptions so we can surface them clearly.
+    _server_error = [None]
 
     def run_server():
-        app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+        try:
+            app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
+        except Exception as exc:
+            _server_error[0] = exc
+            sys.__stderr__.write(f"\n❌ Flask server crashed: {exc}\n")
+            traceback.print_exc(file=sys.__stderr__)
 
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
-    time.sleep(2)
 
+    # ── 1) Wait until Flask is actually responding on localhost ──
+    _local_ready = False
+    _last_local_err = None
+    for _attempt in range(80):          # ~40 s total
+        # If the server thread already died, stop waiting
+        if _server_error[0] is not None:
+            break
+        try:
+            _r = _requests.get(f"http://127.0.0.1:{PORT}/api/keepalive", timeout=0.75)
+            if _r.status_code == 200:
+                _local_ready = True
+                break
+        except Exception as _e:
+            _last_local_err = _e
+        time.sleep(0.5)
+
+    if not _local_ready:
+        raise RuntimeError(
+            f"Flask server never became reachable on localhost:{PORT}.\n"
+            f"  Server-thread error : {_server_error[0]}\n"
+            f"  Last health-check error: {_last_local_err}\n"
+            f"  Common causes: port bind failure, crash in server thread, missing deps."
+        )
+
+    sys.__stdout__.write(f"✅ Flask server healthy on localhost:{PORT}\n")
+
+    # ── 2) Obtain & verify public URL ──
     public_url = None
 
     if IN_COLAB:
-        try:
-            public_url = eval_js("google.colab.kernel.proxyPort(5000, {'cache': false})")
-            if public_url and not public_url.startswith("http"):
-                public_url = "https://" + public_url
-        except Exception as e:
-            sys.__stdout__.write(f"⚠ eval_js proxyPort failed: {e}\n")
+        _last_proxy_err = None
+        for _proxy_attempt in range(30):   # ~15 s
+            # 2a) Ask Colab for the proxy URL
+            try:
+                _candidate = eval_js(
+                    f"google.colab.kernel.proxyPort({PORT}, {{'cache': false}})"
+                )
+                if _candidate and not _candidate.startswith("http"):
+                    _candidate = "https://" + _candidate
+            except Exception as _pe:
+                _last_proxy_err = _pe
+                _candidate = None
+
+            if _candidate:
+                # 2b) Verify the proxy actually routes to our server
+                try:
+                    _rr = _requests.get(
+                        _candidate.rstrip("/") + "/api/keepalive", timeout=4
+                    )
+                    if _rr.status_code == 200:
+                        public_url = _candidate
+                        break
+                except Exception:
+                    pass          # proxy not ready yet — retry
+
+            time.sleep(0.5)
 
         if not public_url:
-            try:
-                hostname = eval_js("window.location.hostname")
-                if hostname:
-                    kernel_url = eval_js("window.location.href")
-                    sys.__stdout__.write(f"  Kernel URL: {kernel_url}\n")
-            except Exception as e:
-                sys.__stdout__.write(f"⚠ hostname fallback failed: {e}\n")
+            raise RuntimeError(
+                f"Could not obtain a working Colab proxy URL for port {PORT}.\n"
+                f"  Last proxyPort error: {_last_proxy_err}\n"
+                f"  The Flask server IS running locally — the problem is the proxy tunnel.\n"
+                f"  Try: Runtime → Disconnect and delete runtime, then reconnect."
+            )
 
-        if public_url:
-            try:
-                from IPython.display import display, HTML
-                display(HTML(f'''
-                <div style="margin:16px 0;padding:16px 24px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
-                    <div style="color:#8A8A8A;font-size:13px;margin-bottom:8px;">🔺 TRELLIS.2 Generator is live — click to open:</div>
-                    <a href="{public_url}" target="_blank" style="color:#E8A917;font-size:18px;font-weight:bold;text-decoration:underline;">{public_url}</a>
-                </div>
-                '''))
-            except:
-                print(f"\n🔺 TRELLIS.2 Generator is live:\n   {public_url}\n")
-        else:
-            print("\n⚠ Could not get Colab proxy URL.")
-            print("  Try opening this manually in your browser:")
-            print("  Look at your Colab URL and replace 'colab.research.google.com' with")
-            print("  '5000-{your-vm-id}.{region}.prod.colab.dev'\n")
-            print("  Or run this in a new cell:")
-            print("  from google.colab.output import eval_js")
-            print("  print(eval_js('google.colab.kernel.proxyPort(5000)'))\n")
+        # ── Display verified link ──
+        from IPython.display import display, HTML as _HTML
+        display(_HTML(f"""
+        <div style="margin:16px 0;padding:16px 24px;background:#141414;border:2px solid #E8A917;border-radius:12px;font-family:monospace;">
+            <div style="color:#8A8A8A;font-size:13px;margin-bottom:8px;">🔺 TRELLIS.2 Generator is live — click to open:</div>
+            <a href="{public_url}" target="_blank" style="color:#E8A917;font-size:18px;font-weight:bold;text-decoration:underline;">{public_url}</a>
+            <div style="color:#8A8A8A;font-size:12px;margin-top:10px;">
+                Health check:
+                <a href="{public_url.rstrip('/')}/api/keepalive" target="_blank"
+                   style="color:#8A8A8A;text-decoration:underline;">/api/keepalive</a>
+            </div>
+        </div>
+        """))
     else:
-        print("\n🔺 TRELLIS.2 Generator running at http://localhost:5000\n")
+        print(f"\n🔺 TRELLIS.2 Generator running at http://localhost:{PORT}\n")
 
     print("Server running. Interrupt cell to stop.\n")
+
     try:
+        _start_ts = time.time()
         while True:
             time.sleep(30)
+            _uptime = int(time.time() - _start_ts)
+            _h, _rem = divmod(_uptime, 3600)
+            _m, _s = divmod(_rem, 60)
             sys.__stdout__.write(
-                f"\r🔺 Uptime: {time.strftime('%H:%M:%S', time.gmtime(time.time()))} | Jobs: {len(jobs)}   ")
+                f"\r🔺 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Jobs: {len(jobs)}   "
+            )
             sys.__stdout__.flush()
     except KeyboardInterrupt:
         print("\n\n🛑 Server stopped.")
