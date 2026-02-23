@@ -264,20 +264,70 @@ def run_gui():
     # ── RMBG lazy ──
     rmbg_pipe = None
     rmbg_lock = threading.Lock()
+    rmbg_load_error = [None]  # track load failures
+
+    def _ensure_monkey_patch():
+        """Apply the all_tied_weights_keys monkey patch for RMBG-1.4 compatibility."""
+        if not hasattr(torch.nn.Module, "_patched_all_tied_weights_keys"):
+            torch.nn.Module._patched_all_tied_weights_keys = True
+
+            @property
+            def _atwk(self): return {}
+
+            setattr(torch.nn.Module, "all_tied_weights_keys", _atwk)
+            print("  🔧 Applied all_tied_weights_keys monkey patch for RMBG-1.4")
 
     def get_rmbg():
-        global rmbg_pipe
-        if rmbg_pipe is None:
-            from transformers import pipeline as hf_pipeline
-            if not hasattr(torch.nn.Module, "_patched_all_tied_weights_keys"):
-                torch.nn.Module._patched_all_tied_weights_keys = True
-
-                @property
-                def _atwk(self): return {}
-
-                setattr(torch.nn.Module, "all_tied_weights_keys", _atwk)
-            rmbg_pipe = hf_pipeline("image-segmentation", model="briaai/RMBG-1.4", trust_remote_code=True)
+        nonlocal rmbg_pipe
+        if rmbg_pipe is not None:
+            return rmbg_pipe
+        with rmbg_lock:
+            # Double-check inside lock
+            if rmbg_pipe is not None:
+                return rmbg_pipe
+            print("🔄 Loading RMBG-1.4 background removal model...")
+            t0 = time.perf_counter()
+            try:
+                _ensure_monkey_patch()
+                from transformers import pipeline as hf_pipeline
+                rmbg_pipe = hf_pipeline(
+                    "image-segmentation",
+                    model="briaai/RMBG-1.4",
+                    trust_remote_code=True,
+                    device=-1,  # CPU — avoids competing with TRELLIS for VRAM
+                )
+                dt = round(time.perf_counter() - t0, 1)
+                print(f"✅ RMBG-1.4 loaded in {dt}s")
+                rmbg_load_error[0] = None
+            except Exception as e:
+                rmbg_load_error[0] = str(e)
+                print(f"❌ RMBG-1.4 load failed: {e}")
+                traceback.print_exc()
+                raise
         return rmbg_pipe
+
+    def has_transparency(img):
+        """Check if a PIL Image has meaningful transparency (alpha channel with non-opaque pixels)."""
+        if img.mode != "RGBA":
+            return False
+        alpha = img.getchannel("A")
+        # Check if any pixel has alpha < 250 (near-opaque threshold)
+        alpha_arr = np.array(alpha)
+        non_opaque = np.sum(alpha_arr < 250)
+        # Need at least 0.5% of pixels to be transparent to count
+        total = alpha_arr.size
+        ratio = non_opaque / total if total > 0 else 0
+        return ratio > 0.005
+
+    def auto_remove_bg(image_path):
+        """Remove background from an image file, return path to transparent PNG."""
+        rmbg = get_rmbg()
+        result = rmbg(str(image_path))
+        # Save alongside original
+        p = pathlib.Path(image_path)
+        out_p = p.parent / f"{p.stem}_autormbg.png"
+        result.save(str(out_p), "PNG")
+        return str(out_p)
 
     # ── State ──
     UPLOAD_DIR = pathlib.Path("/content/_trellis_uploads");
@@ -677,6 +727,23 @@ def run_gui():
                 job["log"].append(f"[{idx + 1}/{total}] Processing: {orig_name}")
                 t0 = time.perf_counter()
 
+                # ── Auto background removal if enabled ──
+                auto_rmbg = s.get("auto_rmbg", True)
+                if auto_rmbg:
+                    try:
+                        test_img = Image.open(file_path)
+                        if not has_transparency(test_img):
+                            job["log"].append(f"  🔍 No transparency detected — auto-removing background...")
+                            job["progress"]["phase"] = "Auto-removing background..."
+                            file_path = auto_remove_bg(file_path)
+                            job["log"].append(f"  ✅ Background removed automatically")
+                        else:
+                            job["log"].append(f"  ✓ Image already has transparency")
+                        del test_img
+                    except Exception as e:
+                        job["log"].append(f"  ⚠ Auto background removal failed: {e} — proceeding with original")
+                        traceback.print_exc()
+
                 error = None
                 for attempt in range(MAX_RETRIES):
                     try:
@@ -1007,7 +1074,13 @@ def run_gui():
 
       <!-- ── GENERATE TAB ── -->
       <div class="tab-panel active" id="tab-generate">
-        <div class="instructions"><strong>Upload your images and generate 3D models.</strong><br>Each image becomes a downloadable GLB model with optional preview render, saved to Google Drive.<br><br><span class="warn">⚠ Images must have transparent backgrounds (PNG with alpha).</span> Use the <strong>Remove Background</strong> tab first if needed.</div>
+        <div class="instructions"><strong>Upload your images and generate 3D models.</strong><br>Each image becomes a downloadable GLB model with optional preview render, saved to Google Drive.<br><br><span class="warn">⚠ Images must have transparent backgrounds (PNG with alpha).</span> Auto-remove is enabled by default, or use the <strong>Remove Background</strong> tab manually.</div>
+        <div class="auto-rmbg-toggle" style="margin:12px 0 16px;padding:12px 16px;background:var(--off-black);border:1px solid var(--dark-border);border-radius:8px;display:flex;align-items:center;gap:12px;">
+          <span style="font-size:.85rem;color:var(--gray-light);font-weight:600;">✂ Auto Background Removal</span>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:var(--green);font-weight:600;"><input type="radio" name="autoRmbg" value="on" checked style="accent-color:var(--green);cursor:pointer;"> On</label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:var(--gray);"><input type="radio" name="autoRmbg" value="off" style="accent-color:var(--gray);cursor:pointer;"> Off</label>
+          <span style="font-size:.7rem;color:var(--gray);margin-left:auto;font-family:var(--font-mono);">Detects &amp; removes backgrounds automatically during generation</span>
+        </div>
         <div class="dropzone" id="dropzone3d"><div class="dropzone-icon">📁</div><div class="dropzone-text">Drag &amp; drop images here, or <strong>click to browse</strong></div><input type="file" id="fileInput3d" multiple accept="image/*"></div>
         <div class="thumbs" id="thumbs3d"></div>
         <button class="settings-toggle" onclick="this.classList.toggle('open');document.getElementById('settingsPanel').classList.toggle('open')">⚙ Generation settings <span class="arrow">▾</span></button>
@@ -1180,7 +1253,7 @@ def run_gui():
     function poll(jobId,type,cfg){if(timers[type])clearInterval(timers[type]);if(!localStart[type])localStart[type]=Date.now();timers[type]=setInterval(async()=>{try{const r=await fetch('/api/status/'+jobId);const d=await r.json();const p=d.progress||{};const elapsed=p.elapsed||((Date.now()-localStart[type])/1000);$(cfg.timer).textContent=fmtTime(elapsed);const pct=p.pct||0;$(cfg.fill).style.width=pct+'%';$(cfg.pct).textContent=Math.round(pct)+'%';$(cfg.phase).textContent=p.phase||'';if(cfg.image&&p.image_num&&p.total)$(cfg.image).textContent='Image '+p.image_num+' of '+p.total+(p.name?' — '+p.name:'');if(d.status==='done')$(cfg.status).innerHTML='<span class="done-icon">✅</span> Complete';else $(cfg.status).innerHTML='<span class="spinner"></span> '+cfg.statusText;if(d.log){const b=$(cfg.log);b.textContent=d.log.join('\n');b.scrollTop=b.scrollHeight}if(cfg.console){const cr=await fetch('/api/console');const cd=await cr.json();const cel=$(cfg.console);cel.textContent=cd.lines.join('\n');cel.scrollTop=cel.scrollHeight}if(d.status==='done'){clearInterval(timers[type]);timers[type]=null;delete localStart[type];if(cfg.btn){cfg.btn.disabled=false;cfg.btn.textContent=cfg.btnText}cfg.renderFn(d.results||[])}}catch(e){console.error(e)}},800)}
 
     /* ── Generate ── */
-    async function startGen(){if(!files3d.length)return;const btn=$('genBtn3d');btn.disabled=true;btn.textContent='Uploading images...';const fd=new FormData();files3d.forEach(f=>fd.append('images',f));fd.append('settings',JSON.stringify({output_dir:$('sOutDir').value,fps:parseInt($('sFps').value),texture_size:parseInt($('sTexture').value),decimate_target:parseInt($('sDecimate').value),remesh:$('sRemesh').checked,remesh_band:parseFloat($('sRemeshBand').value),render_mode:selectedRenderMode,video_resolution:512,sprite_directions:parseInt($('sSpriteDirections').value),sprite_size:parseInt($('sSpriteSize').value),sprite_pitch:parseFloat($('sSpritePitch').value),doom_directions:parseInt($('sDoomDirections').value),doom_size:parseInt($('sDoomSize').value),doom_pitch:parseFloat($('sDoomPitch').value)}));try{const r=await fetch('/api/generate',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Generating...';show('progressPanel3d');show('logBox3d');$('logBox3d').textContent='';hide('results3d');$('resultsList3d').innerHTML='';$('pFill3d').style.width='0%';$('pPct3d').textContent='0%';localStart['generate']=Date.now();poll(d.job_id,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:btn,btnText:'Generate 3D models →',renderFn:render3d})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate 3D models →'}}
+    async function startGen(){if(!files3d.length)return;const btn=$('genBtn3d');btn.disabled=true;btn.textContent='Uploading images...';const autoRmbg=document.querySelector('input[name="autoRmbg"]:checked').value==='on';const fd=new FormData();files3d.forEach(f=>fd.append('images',f));fd.append('settings',JSON.stringify({output_dir:$('sOutDir').value,fps:parseInt($('sFps').value),texture_size:parseInt($('sTexture').value),decimate_target:parseInt($('sDecimate').value),remesh:$('sRemesh').checked,remesh_band:parseFloat($('sRemeshBand').value),render_mode:selectedRenderMode,video_resolution:512,sprite_directions:parseInt($('sSpriteDirections').value),sprite_size:parseInt($('sSpriteSize').value),sprite_pitch:parseFloat($('sSpritePitch').value),doom_directions:parseInt($('sDoomDirections').value),doom_size:parseInt($('sDoomSize').value),doom_pitch:parseFloat($('sDoomPitch').value),auto_rmbg:autoRmbg}));try{const r=await fetch('/api/generate',{method:'POST',body:fd});const d=await r.json();if(!d.job_id)throw new Error(d.error||'Failed');btn.textContent='Generating...';show('progressPanel3d');show('logBox3d');$('logBox3d').textContent='';hide('results3d');$('resultsList3d').innerHTML='';$('pFill3d').style.width='0%';$('pPct3d').textContent='0%';localStart['generate']=Date.now();poll(d.job_id,'generate',{timer:'pTimer3d',fill:'pFill3d',pct:'pPct3d',phase:'pPhase3d',status:'pStatus3d',statusText:'Generating...',image:'pImage3d',log:'logBox3d',console:'consoleScroll3d',btn:btn,btnText:'Generate 3D models →',renderFn:render3d})}catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate 3D models →'}}
 
     /* ── Render results — handles all media types including RTS and Doom sprites ── */
     function render3d(results){if(!results.length)return;show('results3d');const l=$('resultsList3d');l.innerHTML='';results.forEach(r=>{const c=document.createElement('div');c.className='result-card';let mediaHtml='';
@@ -1246,7 +1319,8 @@ def run_gui():
                      ("remesh", True), ("remesh_band", 1.0), ("render_mode", "video"),
                      ("video_resolution", 512),
                      ("sprite_directions", 16), ("sprite_size", 256), ("sprite_pitch", 0.52),
-                     ("doom_directions", 8), ("doom_size", 256), ("doom_pitch", 0.0)]:
+                     ("doom_directions", 8), ("doom_size", 256), ("doom_pitch", 0.0),
+                     ("auto_rmbg", True)]:
             settings.setdefault(k, v)
 
         # ── Validate output_dir: must resolve under a safe base path ──
