@@ -268,23 +268,45 @@ def run_batch_packer():
         for i, (x, y, w, h) in enumerate(placements):
             canvas.paste(processed_images[i], (x, y), processed_images[i])
 
+        # ── Always run RMBG-1.4 on the final combined image ──
+        job["progress"]["phase"] = "Running RMBG on combined image..."
+        job["log"].append("🔄 Running RMBG-1.4 on final combined image...")
+        try:
+            # Save temp composite for RMBG pipeline input
+            temp_composite = OUTPUT_DIR / f"_temp_composite_{job_id}.png"
+            canvas.save(str(temp_composite), "PNG")
+            rmbg = get_rmbg()
+            final_img = rmbg(str(temp_composite))
+            if final_img.mode != "RGBA":
+                final_img = final_img.convert("RGBA")
+            job["log"].append("✅ Background removed from combined image")
+            # Clean up temp
+            try:
+                temp_composite.unlink()
+            except:
+                pass
+        except Exception as e:
+            job["log"].append(f"⚠ RMBG on combined image failed: {e} — using composited version")
+            final_img = canvas
+
         # Save result
         out_name = f"batch_packed_{job_id}.png"
         out_path = OUTPUT_DIR / out_name
-        canvas.save(str(out_path), "PNG")
+        final_img.save(str(out_path), "PNG")
 
+        final_w, final_h = final_img.width, final_img.height
         used_area = sum(w * h for w, h in sizes)
-        total_area = total_w * total_h
+        total_area = final_w * final_h
         utilization = round((used_area / total_area) * 100) if total_area > 0 else 0
 
         dt = time.perf_counter() - t0
-        job["log"].append(f"\n✅ Packed {len(processed_images)} images → {total_w}×{total_h} ({utilization}% utilization) in {dt:.1f}s")
+        job["log"].append(f"\n✅ Packed {len(processed_images)} images → {final_w}×{final_h} ({utilization}% utilization) in {dt:.1f}s")
         job["status"] = "done"
         job["result"] = {
             "file": str(out_path),
             "filename": out_name,
-            "width": total_w,
-            "height": total_h,
+            "width": final_w,
+            "height": final_h,
             "count": len(processed_images),
             "utilization": utilization,
             "images": processed_info,
@@ -295,7 +317,7 @@ def run_batch_packer():
             "elapsed": round(dt, 1),
         }
 
-        del processed_images, canvas
+        del processed_images, canvas, final_img
         gc.collect()
 
     # ══════════════════════════════════════════════════════════════
@@ -519,14 +541,15 @@ a{color:var(--gold);text-decoration:none}
 
   <div class="instructions">
     <strong>Upload your individual asset images</strong> and pack them into a single combined image.<br>
-    Backgrounds are <span class="hl">automatically removed via RMBG-1.4</span> (same model as the main TRELLIS.2 pipeline).
-    Each image is trimmed, normalized, and bin-packed to maximize canvas utilization.
+    Backgrounds are <span class="hl">automatically removed via RMBG-1.4</span> (same model as the main TRELLIS.2 pipeline) — both per-image before packing, and on the final combined output.
+    Each image is trimmed, normalized, and bin-packed into a square grid.
     Download the result and feed it into TRELLIS.2 for bulk 3D generation.
   </div>
 
   <div class="dropzone" id="dropzone">
     <div class="dropzone-icon">📂</div>
     <div class="dropzone-text">Drag &amp; drop images here, or <strong>click to browse</strong></div>
+    <div style="font-size:.72rem;color:var(--gray);margin-top:6px;">PNG, JPG, WebP, BMP, GIF, TIFF, AVIF, ICO — any image format</div>
     <input type="file" id="fileInput" multiple accept="image/*">
   </div>
   <div class="thumbs" id="thumbs"></div>
@@ -534,11 +557,12 @@ a{color:var(--gold);text-decoration:none}
   <div class="settings-card">
     <div class="settings-title">Settings</div>
     <div class="field">
-      <label>Background Removal (RMBG-1.4)</label>
+      <label>Per-Image Background Removal</label>
       <div class="toggle-group">
         <button class="toggle-btn active" data-val="on" onclick="setRmbg(true,this)">✂ Auto Remove</button>
         <button class="toggle-btn" data-val="off" onclick="setRmbg(false,this)">None</button>
       </div>
+      <div style="font-size:.7rem;color:var(--gray);margin-top:6px;font-family:var(--font-mono);">Per-image BG removal before packing. RMBG-1.4 always runs on the final combined image.</div>
     </div>
     <div class="field-row">
       <div class="field">
@@ -604,9 +628,9 @@ dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('over');ad
 fi.addEventListener('change',e=>{addFiles(e.target.files);fi.value=''});
 
 function addFiles(fileList){
-  const valid=['image/png','image/jpeg','image/webp','image/bmp','image/gif'];
+  const valid=['image/'];
   for(const f of fileList){
-    if(!valid.includes(f.type))continue;
+    if(!f.type.startsWith('image/'))continue;
     uploadedFiles.push(f);
   }
   updateThumbs();
@@ -968,3 +992,6 @@ function toggleConsole(){
     except KeyboardInterrupt:
         print("\n\n🛑 Server stopped.")
 
+
+# ── Entry point ──
+run_batch_packer()
