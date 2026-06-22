@@ -20,7 +20,11 @@ def patch_transformers_missing_all_tied_weights_keys() -> None:
         PreTrainedModel._trellis2_orig_mark_tied_weights_as_initialized = orig_mark
 
         def _trellis2_safe_mark_tied_weights_as_initialized(self, *args, **kwargs):
-            if not hasattr(self, "all_tied_weights_keys"):
+            # The real method does `all_tied_weights_keys.keys()`, assuming a dict.
+            # Some models (e.g. RMBG-1.4's custom briarmbg) set it to a tuple/None,
+            # or don't set it at all. Skip in those cases instead of crashing.
+            atwk = getattr(self, "all_tied_weights_keys", None)
+            if not isinstance(atwk, dict):
                 return
             return PreTrainedModel._trellis2_orig_mark_tied_weights_as_initialized(
                 self, *args, **kwargs
