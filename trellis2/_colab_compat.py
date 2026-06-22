@@ -19,10 +19,12 @@ def patch_transformers_missing_all_tied_weights_keys() -> None:
     if orig_mark is not None and not hasattr(PreTrainedModel, "_trellis2_orig_mark_tied_weights_as_initialized"):
         PreTrainedModel._trellis2_orig_mark_tied_weights_as_initialized = orig_mark
 
-        def _trellis2_safe_mark_tied_weights_as_initialized(self):
+        def _trellis2_safe_mark_tied_weights_as_initialized(self, *args, **kwargs):
             if not hasattr(self, "all_tied_weights_keys"):
                 return
-            return PreTrainedModel._trellis2_orig_mark_tied_weights_as_initialized(self)
+            return PreTrainedModel._trellis2_orig_mark_tied_weights_as_initialized(
+                self, *args, **kwargs
+            )
 
         PreTrainedModel.mark_tied_weights_as_initialized = _trellis2_safe_mark_tied_weights_as_initialized
 
