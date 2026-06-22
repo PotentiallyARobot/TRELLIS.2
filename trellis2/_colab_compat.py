@@ -40,7 +40,9 @@ def patch_transformers_missing_all_tied_weights_keys() -> None:
         def _trellis2_safe_move_missing_keys_from_meta_to_device(
             self, missing_keys, device_map, device_mesh, hf_quantizer
         ):
-            if not hasattr(self, "all_tied_weights_keys"):
+            # RMBG-1.4 sets all_tied_weights_keys to a tuple, but the real method
+            # calls .keys() on it. Coerce anything non-dict to {} before forwarding.
+            if not isinstance(getattr(self, "all_tied_weights_keys", None), dict):
                 self.all_tied_weights_keys = {}
             return PreTrainedModel._trellis2_orig_move_missing_keys_from_meta_to_device(
                 self, missing_keys, device_map, device_mesh, hf_quantizer
