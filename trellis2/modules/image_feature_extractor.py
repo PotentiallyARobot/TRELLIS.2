@@ -79,16 +79,18 @@ class DinoV3FeatureExtractor:
         self.model.cpu()
 
     def extract_features(self, image: torch.Tensor) -> torch.Tensor:
+        # transformers 5.x moved the encoder under self.model.model and changed
+        # DINOv3ViTLayer's call signature/outputs, so the old hand-walked loop
+        # over self.model.layer no longer works. Call the model directly and let
+        # transformers handle its own internals. We request hidden_states and take
+        # the last block's output (pre the model's final norm) to match the
+        # original code, which applied its OWN F.layer_norm to pre-norm features.
         image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.model.embeddings(image, bool_masked_pos=None)
-        position_embeddings = self.model.rope_embeddings(image)
-
-        for i, layer_module in enumerate(self.model.layer):
-            hidden_states = layer_module(
-                hidden_states,
-                position_embeddings=position_embeddings,
-            )
-
+        outputs = self.model(image, output_hidden_states=True)
+        # hidden_states[-1] is the final block output before the model's norm;
+        # last_hidden_state may be post-norm depending on the model. Using the
+        # former keeps parity with the original pre-norm + own-layernorm path.
+        hidden_states = outputs.hidden_states[-1]
         return F.layer_norm(hidden_states, hidden_states.shape[-1:])
         
     @torch.no_grad()
